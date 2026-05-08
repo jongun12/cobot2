@@ -7,7 +7,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
-from od_msg.srv import SrvDetections
+from od_msg.srv import SrvBasePositions
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image
 from ament_index_python.packages import get_package_share_directory
@@ -58,20 +58,20 @@ class DetectCalPosService(Node):
             callback_group=self.callback_group,
         )
         self.create_service(
-            SrvDetections,
-            "inner_objects_points",
+            SrvBasePositions,
+            'get_base_positions', #,"inner_objects_points",
             self.handle_inner_objects_points,
             callback_group=self.callback_group,
         )
         self.create_service(
-            SrvDetections,
+            SrvBasePositions,
             "center_of_center_points",
             self.handle_center_of_center_points,
             callback_group=self.callback_group,
         )
         self.create_service(
-            SrvDetections,
-            "center_object_points",
+            SrvBasePositions,
+            'get_center_base_positions',#"center_object_points",
             self.handle_center_object_points,
             callback_group=self.callback_group,
         )
@@ -103,16 +103,15 @@ class DetectCalPosService(Node):
 
     def handle_inner_objects_points(self, request, response):
         self.get_logger().info("inner_objects_points request received.")
-        frame, detections = self.detect_from_color_image(
-            confidence_threshold=request.confidence_threshold
-            or DEFAULT_CONFIDENCE_THRESHOLD,
-            iou_threshold=request.iou_threshold or DEFAULT_IOU_THRESHOLD,
-        )
-        if frame is None:
-            response.boxes = []
-            response.class_ids = []
-            response.scores = []
+        frame, depth_image, camera_info = self.get_frames_once()
+        if frame is None or depth_image is None or camera_info is None:
+            self._set_empty_base_position_response(
+                response,
+                "Failed to receive color image, depth image, or camera info.",
+            )
             return response
+
+        _, detections = self.detect_from_color_image(color_image=frame)
 
         edge_detections, inner_detections = self.split_inner_detections(
             frame,
@@ -122,29 +121,124 @@ class DetectCalPosService(Node):
         self._log_detection_counts(inner_detections, edge_detections)
         self._publish_detection_image(frame, edge_detections, inner_detections)
 
-        response.boxes = self._flatten_boxes(inner_detections)
-        response.class_ids = [detection["class_id"] for detection in inner_detections]
-        response.scores = [detection["score"] for detection in inner_detections]
+        robot_posx = self.request_robot_posx()
+        if robot_posx is None:
+            self._set_empty_base_position_response(
+                response,
+                "Failed to receive current robot posx.",
+            )
+            return response
+
+        base_positions = []
+        for detection in inner_detections:
+            cx, cy = self._get_box_center(detection["box"])
+            xyz = self.get_xyz_from_pixel(
+                cx,
+                cy,
+                depth_image=depth_image,
+                camera_info=camera_info,
+                robot_posx=robot_posx,
+            )
+            if xyz is None:
+                continue
+
+            x, y, z = xyz
+            base_positions.append(
+                {
+                    "box": detection["box"],
+                    "class_id": detection["class_id"],
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                    "rx": 0.0,
+                    "ry": 180.0,
+                    "rz": 0.0,
+                }
+            )
+
+        self._set_base_position_response(
+            response,
+            base_positions,
+            f"Calculated {len(base_positions)} inner object positions.",
+        )
         return response
 
     def handle_center_of_center_points(self, request, response):
         self.get_logger().info("center_of_center_points request received.")
-        return self._handle_center_detection(request, response)
+        return self._handle_center_detection(response)
 
     def handle_center_object_points(self, request, response):
         self.get_logger().info("center_object_points request received.")
-        return self._handle_center_detection(request, response)
+        frame, depth_image, camera_info = self.get_frames_once()
+        if frame is None or depth_image is None or camera_info is None:
+            self._set_empty_base_position_response(
+                response,
+                "Failed to receive color image, depth image, or camera info.",
+            )
+            return response
 
-    def _handle_center_detection(self, request, response):
-        frame, detections = self.detect_from_color_image(
-            confidence_threshold=request.confidence_threshold
-            or DEFAULT_CONFIDENCE_THRESHOLD,
-            iou_threshold=request.iou_threshold or DEFAULT_IOU_THRESHOLD,
+        _, detections = self.detect_from_color_image(color_image=frame)
+        center_detection = self.select_center_detection(frame, detections)
+        center_detections = [center_detection] if center_detection is not None else []
+        self._publish_detection_image(frame, [], center_detections)
+        if center_detection is None:
+            self._set_empty_base_position_response(
+                response,
+                "No center object detected.",
+            )
+            return response
+
+        cx, cy = self._get_box_center(center_detection["box"])
+        robot_posx = self.request_robot_posx()
+        if robot_posx is None:
+            self._set_empty_base_position_response(
+                response,
+                "Failed to receive current robot posx.",
+            )
+            return response
+
+        xyz = self.get_xyz_from_pixel(
+            cx,
+            cy,
+            depth_image=depth_image,
+            camera_info=camera_info,
+            robot_posx=robot_posx,
         )
+        if xyz is None:
+            self._set_empty_base_position_response(
+                response,
+                "Failed to calculate center object xyz.",
+            )
+            return response
+
+        rx, ry, rz = self.get_rxyz_from_box(
+            center_detection["box"],
+            color_image=frame,
+            depth_image=depth_image,
+            camera_info=camera_info,
+        )
+        x, y, z = xyz
+        position = {
+            "box": center_detection["box"],
+            "class_id": center_detection["class_id"],
+            "x": x,
+            "y": y,
+            "z": z,
+            "rx": rx,
+            "ry": ry,
+            "rz": rz,
+        }
+        self._set_base_position_response(
+            response,
+            [position],
+            "Calculated center object position.",
+        )
+        return response
+
+    def _handle_center_detection(self, response):
+        frame, detections = self.detect_from_color_image()
         if frame is None:
-            response.boxes = []
-            response.class_ids = []
-            response.scores = []
+            self._set_empty_base_position_response(response, "Color image is empty.")
             return response
 
         center_detection = self.select_center_detection(frame, detections)
@@ -152,18 +246,25 @@ class DetectCalPosService(Node):
         self._publish_detection_image(frame, [], center_detections)
 
         response.boxes = self._flatten_boxes(center_detections)
-        response.class_ids = [
-            detection["class_id"] for detection in center_detections
-        ]
-        response.scores = [detection["score"] for detection in center_detections]
+        response.class_ids = [detection["class_id"] for detection in center_detections]
+        response.xs = []
+        response.ys = []
+        response.zs = []
+        response.rxs = []
+        response.rys = []
+        response.rzs = []
+        response.success = bool(center_detections)
+        response.message = f"Detected {len(center_detections)} center object."
         return response
 
     def detect_from_color_image(
         self,
+        color_image=None,
         confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD,
         iou_threshold=DEFAULT_IOU_THRESHOLD,
     ):
-        color_image, _, _ = self.get_frames_once()
+        if color_image is None:
+            color_image, _, _ = self.get_frames_once()
         if color_image is None:
             self.get_logger().warn("Cannot detect objects: color image is empty.")
             return None, []
@@ -175,6 +276,30 @@ class DetectCalPosService(Node):
         )
         self.get_logger().info(f"Detected {len(detections)} objects.")
         return color_image, detections
+
+    def _set_base_position_response(self, response, positions, message):
+        response.boxes = self._flatten_boxes(positions)
+        response.class_ids = [position["class_id"] for position in positions]
+        response.xs = [position["x"] for position in positions]
+        response.ys = [position["y"] for position in positions]
+        response.zs = [position["z"] for position in positions]
+        response.rxs = [position["rx"] for position in positions]
+        response.rys = [position["ry"] for position in positions]
+        response.rzs = [position["rz"] for position in positions]
+        response.success = bool(positions)
+        response.message = message
+
+    def _set_empty_base_position_response(self, response, message):
+        response.boxes = []
+        response.class_ids = []
+        response.xs = []
+        response.ys = []
+        response.zs = []
+        response.rxs = []
+        response.rys = []
+        response.rzs = []
+        response.success = False
+        response.message = message
 
     def split_inner_detections(
         self,
@@ -290,8 +415,16 @@ class DetectCalPosService(Node):
             f"{class_id}: {count}" for class_id, count in sorted(counts.items())
         )
 
-    def get_xyz_from_pixel(self, x, y):
-        _, depth_image, camera_info = self.get_frames_once()
+    def get_xyz_from_pixel(
+        self,
+        x,
+        y,
+        depth_image=None,
+        camera_info=None,
+        robot_posx=None,
+    ):
+        if depth_image is None or camera_info is None:
+            _, depth_image, camera_info = self.get_frames_once()
         if depth_image is None or camera_info is None:
             return None
 
@@ -306,7 +439,8 @@ class DetectCalPosService(Node):
         if camera_coord is None:
             return None
 
-        robot_posx = self.request_robot_posx()
+        if robot_posx is None:
+            robot_posx = self.request_robot_posx()
         if robot_posx is None:
             return None
 
@@ -321,6 +455,10 @@ class DetectCalPosService(Node):
             % (int(x), int(y), depth, xyz[0], xyz[1], xyz[2])
         )
         return xyz
+
+    def _get_box_center(self, box):
+        x1, y1, x2, y2 = box
+        return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
     def _get_depth_or_nearest(self, depth_image, x, y):
         height, width = depth_image.shape[:2]

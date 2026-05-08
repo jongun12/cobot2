@@ -43,13 +43,8 @@ setup(
             'detect_cal_pos_service = cobot2.detect_cal_pos_service:main',
             'cal_position = cobot2.cal_position:main',
             'realsense_service = cobot2.realsense2:main',
-            'robot_move1 = cobot2.robot_move1:main',
-            'robot_move2 = cobot2.robot_move2:main',
-            'robot_move3 = cobot2.robot_move3:main',
             'robot_move4 = cobot2.robot_move4:main',
             'robot_move_total = cobot2.robot_move_total:main',
-            'shaking1_test = cobot2.shaking1_test:main',
-            'yoloe_seg_camera = cobot2.yoloe_model_test1:main',
         ],
     },
 )

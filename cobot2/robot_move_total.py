@@ -125,6 +125,28 @@ class RobotMoveNode(Node):
 
             return class_ids
 
+    def prompt_target_class_ids_before_scan(self):
+        while True:
+            user_input = input(
+                "Pick class_id(s) to move (ex: 1 or 1,2,3 / all / q): "
+            ).strip()
+            if user_input.lower() == "q":
+                self.get_logger().info("Quit the program...")
+                return None
+
+            if user_input.lower() == "all":
+                return "all"
+
+            class_id_texts = user_input.replace(",", " ").split()
+            if not class_id_texts:
+                print("Please enter at least one class_id.")
+                continue
+
+            try:
+                return [int(class_id_text) for class_id_text in class_id_texts]
+            except ValueError:
+                print("Please enter numeric class_id values.")
+
     def pick_and_place_class(self, class_ids, positions_by_class):
         target_class_ids = [class_ids] if isinstance(class_ids, int) else class_ids
         target_positions = []
@@ -171,17 +193,23 @@ class RobotMoveNode(Node):
         from DSR_ROBOT2 import movel, movej, mwait, posx, DR_MV_MOD_REL, trans, DR_TOOL
 
         if class_id == 1:  # plastic bottle
-            thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5]
+            thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5] # 1
+            thrash_bin_posj = [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
         elif class_id == 2:  # label o
             thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5]
+            thrash_bin_posj = [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
         elif class_id == 3:  # plastic bottle
             thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5]
+            thrash_bin_posj = [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
         elif class_id == 4:  # can
             thrash_bin_pos = [402.8, -429.4, 189.2, -65.2, 179.5, -64.4]
+            thrash_bin_posj = [-47.38, 32.53, 49.7, -0.09, 97.36, -46.6]
         elif class_id == 5:  # box
             thrash_bin_pos = [731.4, -429.4, 170, -17.5, 144.8, -13.7]
+            thrash_bin_posj = [-34.81, 44.83, 41.64, 11.51, 60.07, -33.78]
         else:
             thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5]
+            thrash_bin_posj = [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
 
         close_picture_pose = list(target_pos)
         close_picture_pose[2] += 40
@@ -238,9 +266,10 @@ class RobotMoveNode(Node):
 
         # pick_pos_up = list(target_pos)
         # pick_pos_up[2] += 100  # 대상 위치 위로 이동
-        pick_pos_up = trans(target_pos, [0, 0, 100, 0, 0, 0], ref=DR_TOOL)
+        pick_up = list(target_pos)
+        pick_up[2] += 150  # 대상 위치 위로 이동
         print("2. Moving to pick position...")
-        movel(pick_pos_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
+        movel(pick_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
 
         print("3. Moving to target position...")
         movel(target_pos, vel=VELOCITY, acc=ACC) # 대상 위치로 이동
@@ -256,8 +285,8 @@ class RobotMoveNode(Node):
         movel(pick_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
 
         print("5. Moving to bucket position...")
-        movel(thrash_bin_pos, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
-
+        # movel(thrash_bin_pos, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
+        movej(thrash_bin_posj, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
         gripper.open_gripper()  # 그리퍼 열기
         while gripper.get_status()[0]:
             time.sleep(0.1)
@@ -425,19 +454,25 @@ def main(args=None):
     DR_init.__dsr__node = dsr_node
     node = RobotMoveNode()
     try:
-        from DSR_ROBOT2 import movel, posx
-        CENTER_POINT = (367.6, 6.3)
+        from DSR_ROBOT2 import movel, posx, movej
+        CENTER_POINT = (367.6, -20.0)
         Z0 = 300
-        WIDTH = 150
+        WIDTH = 200
         HIGHT = 150
+        target_class_ids = node.prompt_target_class_ids_before_scan()
         for i in range(4):
             p = posx([CENTER_POINT[0] + (-WIDTH/2 if i%2==0 else WIDTH/2), CENTER_POINT[1] + (HIGHT/2 if i//2==0 else -HIGHT/2), Z0, 0, 180, 0])
             print(p)
             movel(p, vel=VELOCITY, acc=ACC)
             positions_by_class = node.request_base_positions()
-            target_class_ids = node.prompt_target_class_ids(positions_by_class)
             if target_class_ids is not None:
-                node.pick_and_place_class(target_class_ids, positions_by_class)
+                current_class_ids = (
+                    sorted(positions_by_class.keys())
+                    if target_class_ids == "all"
+                    else target_class_ids
+                )
+                node.pick_and_place_class(current_class_ids, positions_by_class)
+        movej(P0, vel=VELOCITY, acc=ACC) # 초기 위치로 이동
     finally:
         node.destroy_node()
         dsr_node.destroy_node()
