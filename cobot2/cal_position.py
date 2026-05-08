@@ -23,14 +23,22 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.5
 DEFAULT_IOU_THRESHOLD = 0.5
 SERVICE_TIMEOUT_SEC = 15.0
 GET_CURRENT_POSX_SERVICE = "/dsr01/aux_control/get_current_posx"
-PCA_THRESHOLD_VALUE = 50
+PCA_BACKGROUND_HUE_MIN = 20
+PCA_BACKGROUND_HUE_MAX = 40
+PCA_BACKGROUND_SATURATION_MIN = 0
+PCA_BACKGROUND_SATURATION_MAX = 255
+PCA_BACKGROUND_VALUE_MIN = 0
+PCA_BACKGROUND_VALUE_MAX = 255
+PCA_MASK_MORPH_KERNEL_SIZE = 5
 PCA_MIN_POINTS = 10
 PCA_LINE_SAMPLE_STEP_PX = 5
-PCA_MIN_3D_POINTS = 4
+PCA_MIN_3D_POINTS = 2 # 4
 DEBUG_IMAGE_DIR = "/tmp/cobot2_cal_position_debug"
 DEBUG_MAX_DEPTH_LABELS = 12
 DEPTH_OUTLIER_ABS_THRESHOLD = 0.03
 DEPTH_OUTLIER_MAD_SCALE = 3.0
+CENTER_ZERO_DEPTH_ROBOT_Z_OFFSET = 100
+ZERO_DEPTH_NEAREST_SEARCH_RADIUS = 30
 
 
 class CalPositionNode(Node):
@@ -280,12 +288,41 @@ class CalPositionNode(Node):
             color_image = self.request_color_image()
 
         positions = []
+        robot_posx_for_depth_fallback = None
         for detection in detections:
             cx, cy = self._get_box_center(detection["box"])
             depth = self._get_depth(depth_image, cx, cy)
-            if not self._is_valid_depth(depth):
+            if not self._is_valid_position_depth(depth):
                 self.get_logger().warn(f"Invalid depth at ({cx}, {cy}): {depth}")
                 continue
+            if calculate_orientation and depth == 0.0:
+                nearest_depth = self._get_nearest_valid_depth(
+                    depth_image,
+                    cx,
+                    cy,
+                    detection["box"],
+                )
+                if nearest_depth is not None:
+                    cx, cy, depth = nearest_depth
+                    self.get_logger().warn(
+                        "Zero depth replaced by nearest valid depth %.3f "
+                        "at (%d, %d)."
+                        % (depth, cx, cy)
+                    )
+                else:
+                    if robot_posx_for_depth_fallback is None:
+                        robot_posx_for_depth_fallback = self.request_robot_posx()
+                    depth = self._get_depth_from_robot_z(robot_posx_for_depth_fallback)
+                    if depth is None:
+                        self.get_logger().warn(
+                            f"Cannot replace zero depth at ({cx}, {cy})."
+                        )
+                        continue
+                    self.get_logger().warn(
+                        "Zero depth at (%d, %d). Using fallback depth %.3f "
+                        "from robot z."
+                        % (cx, cy, depth)
+                    )
 
             camera_position = self._pixel_to_camera_coords(cx, cy, depth, camera_info)
             position = {
@@ -455,7 +492,19 @@ class CalPositionNode(Node):
         )
 
     def _get_center_yzx_euler(self, horizontal_angle, vertical_angle): # horizontal_angle 좌우각도, vertical_angle 상하각도
+        horizontal_angle, vertical_angle = self._fold_gripper_symmetric_angles(
+            horizontal_angle,
+            vertical_angle,
+        )
         return [179, horizontal_angle, vertical_angle]
+
+    def _fold_gripper_symmetric_angles(self, horizontal_angle, vertical_angle):
+        horizontal_angle = ((horizontal_angle + 180.0) % 360.0) - 180.0
+        if horizontal_angle >= 90.0:
+            return horizontal_angle - 180.0, -vertical_angle
+        if horizontal_angle < -90.0:
+            return horizontal_angle + 180.0, -vertical_angle
+        return horizontal_angle, vertical_angle
 
     def transform_to_base(self, camera_coords, gripper2cam_path, robot_pos):
         gripper2cam = np.load(gripper2cam_path)
@@ -478,6 +527,41 @@ class CalPositionNode(Node):
             self.get_logger().warn(f"Coordinates ({x}, {y}) out of range.")
             return None
         return float(depth_image[y, x])
+
+    def _get_depth_from_robot_z(self, robot_posx):
+        if robot_posx is None or len(robot_posx) < 3:
+            return None
+        depth = float(robot_posx[2]) - CENTER_ZERO_DEPTH_ROBOT_Z_OFFSET
+        if not self._is_valid_position_depth(depth):
+            return None
+        return depth
+
+    def _get_nearest_valid_depth(self, depth_image, center_x, center_y, box):
+        height, width = depth_image.shape[:2]
+        box_x1, box_y1, box_x2, box_y2 = map(int, box)
+        x1 = max(0, box_x1, center_x - ZERO_DEPTH_NEAREST_SEARCH_RADIUS)
+        y1 = max(0, box_y1, center_y - ZERO_DEPTH_NEAREST_SEARCH_RADIUS)
+        x2 = min(width, box_x2, center_x + ZERO_DEPTH_NEAREST_SEARCH_RADIUS + 1)
+        y2 = min(height, box_y2, center_y + ZERO_DEPTH_NEAREST_SEARCH_RADIUS + 1)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        roi = depth_image[y1:y2, x1:x2]
+        valid_mask = np.isfinite(roi) & (roi > 0)
+        if not np.any(valid_mask):
+            return None
+
+        valid_ys, valid_xs = np.where(valid_mask)
+        image_xs = valid_xs + x1
+        image_ys = valid_ys + y1
+        squared_distances = (
+            (image_xs - center_x) * (image_xs - center_x)
+            + (image_ys - center_y) * (image_ys - center_y)
+        )
+        nearest_index = int(np.argmin(squared_distances))
+        nearest_x = int(image_xs[nearest_index])
+        nearest_y = int(image_ys[nearest_index])
+        return nearest_x, nearest_y, float(depth_image[nearest_y, nearest_x])
 
     def _pixel_to_camera_coords(self, x, y, z, camera_info):
         fx = camera_info.k[0]
@@ -782,13 +866,7 @@ class CalPositionNode(Node):
         if roi.size == 0:
             return None
 
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(
-            gray,
-            PCA_THRESHOLD_VALUE,
-            255,
-            cv2.THRESH_BINARY_INV,
-        )
+        mask = self._make_hue_object_mask(roi)
 
         points = np.column_stack(np.where(mask > 0))
         if len(points) < PCA_MIN_POINTS:
@@ -802,6 +880,37 @@ class CalPositionNode(Node):
         cy = int(center[0]) + y1
         vx, vy = float(direction[1]), float(direction[0])
         return x1, y1, x2, y2, cx, cy, vx, vy, mask
+
+    def _make_hue_object_mask(self, image):
+        hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower_background = np.array(
+            [
+                PCA_BACKGROUND_HUE_MIN,
+                PCA_BACKGROUND_SATURATION_MIN,
+                PCA_BACKGROUND_VALUE_MIN,
+            ],
+            dtype=np.uint8,
+        )
+        upper_background = np.array(
+            [
+                PCA_BACKGROUND_HUE_MAX,
+                PCA_BACKGROUND_SATURATION_MAX,
+                PCA_BACKGROUND_VALUE_MAX,
+            ],
+            dtype=np.uint8,
+        )
+        background_mask = cv2.inRange(
+            hsv_image,
+            lower_background,
+            upper_background,
+        )
+        object_mask = cv2.bitwise_not(background_mask)
+        kernel = np.ones(
+            (PCA_MASK_MORPH_KERNEL_SIZE, PCA_MASK_MORPH_KERNEL_SIZE),
+            np.uint8,
+        )
+        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_OPEN, kernel)
+        return cv2.morphologyEx(object_mask, cv2.MORPH_CLOSE, kernel)
 
     def _sample_pca_line_pixels(
         self,
@@ -840,6 +949,9 @@ class CalPositionNode(Node):
 
     def _is_valid_depth(self, depth):
         return depth is not None and np.isfinite(depth) and depth > 0
+
+    def _is_valid_position_depth(self, depth):
+        return depth is not None and np.isfinite(depth) and depth >= 0
 
     def _flatten_boxes(self, positions):
         boxes = []

@@ -11,7 +11,6 @@ ROBOT_ID = "dsr01"
 ROBOT_MODEL = "m0609"
 VELOCITY, ACC = 60, 60
 BUCKET_POS = [319.4, -211.9, 450.7, 155.1, 179.8, 155.4]
-P0 = [0, 0, 90, 0, 90, 0]
 P0 = [3.31, 0.1, 76.66, 0, 102.75, 7.79]
 
 DR_init.__dsr__id = ROBOT_ID
@@ -169,20 +168,20 @@ class RobotMoveNode(Node):
                 self.side_pick_and_place_target(position["class_id"], target_pos)
             
     def pick_and_place_target(self, class_id, target_pos):
-        from DSR_ROBOT2 import movel, movej, mwait, posx, DR_MV_MOD_REL
+        from DSR_ROBOT2 import movel, movej, mwait, posx, DR_MV_MOD_REL, trans, DR_TOOL
 
         if class_id == 1:  # plastic bottle
-            thrash_bin_pos = [300, -300, 200, 155.1, 179.8, 155.4]
+            thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5]
         elif class_id == 2:  # label o
-            thrash_bin_pos = [300, -300, 200, 155.1, 179.8, 155.4]
+            thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5]
         elif class_id == 3:  # plastic bottle
-            thrash_bin_pos = [300, -300, 200, 155.1, 179.8, 155.4]
+            thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5]
         elif class_id == 4:  # can
-            thrash_bin_pos = [400, -300, 200, 155.1, 179.8, 155.4]
+            thrash_bin_pos = [402.8, -429.4, 189.2, -65.2, 179.5, -64.4]
         elif class_id == 5:  # box
-            thrash_bin_pos = [500, -300, 200, 155.1, 179.8, 155.4]
+            thrash_bin_pos = [731.4, -429.4, 170, -17.5, 144.8, -13.7]
         else:
-             thrash_bin_pos = [300, -300, 200, 155.1, 179.8, 155.4]
+            thrash_bin_pos = [109.9, -456.8, 183.9, -60.5, 179.5, -59.5]
 
         close_picture_pose = list(target_pos)
         close_picture_pose[2] += 40
@@ -230,10 +229,16 @@ class RobotMoveNode(Node):
                         "get_center_base_positions returned no positions."
                     )
 
-        target_pos[2] += -60  # 정확한 위치 (조정 필요)
+        if center_position["class_id"] == 1:  # label x
+            target_pos[2] = 100  # 정확한 위치 (조정 필요)
+        elif center_position["class_id"] == 2:  # label o
+            target_pos[2] = 100  # 정확한 위치 (조정 필요)
+        else:
+            target_pos[2] += -70  # 정확한 위치 (조정 필요)
 
-        pick_pos_up = list(target_pos)
-        pick_pos_up[2] += 100  # 대상 위치 위로 이동
+        # pick_pos_up = list(target_pos)
+        # pick_pos_up[2] += 100  # 대상 위치 위로 이동
+        pick_pos_up = trans(target_pos, [0, 0, 100, 0, 0, 0], ref=DR_TOOL)
         print("2. Moving to pick position...")
         movel(pick_pos_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
 
@@ -246,8 +251,9 @@ class RobotMoveNode(Node):
             time.sleep(0.1)
 
         print("4. Moving up with the object...")
-        pick_pos_up[2] += 100  # 대상 위치 위로 이동
-        movel(pick_pos_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
+        pick_up = list(target_pos)
+        pick_up[2] += 150  # 대상 위치 위로 이동
+        movel(pick_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
 
         print("5. Moving to bucket position...")
         movel(thrash_bin_pos, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
@@ -419,10 +425,19 @@ def main(args=None):
     DR_init.__dsr__node = dsr_node
     node = RobotMoveNode()
     try:
-        positions_by_class = node.request_base_positions()
-        target_class_ids = node.prompt_target_class_ids(positions_by_class)
-        if target_class_ids is not None:
-            node.pick_and_place_class(target_class_ids, positions_by_class)
+        from DSR_ROBOT2 import movel, posx
+        CENTER_POINT = (367.6, 6.3)
+        Z0 = 300
+        WIDTH = 150
+        HIGHT = 150
+        for i in range(4):
+            p = posx([CENTER_POINT[0] + (-WIDTH/2 if i%2==0 else WIDTH/2), CENTER_POINT[1] + (HIGHT/2 if i//2==0 else -HIGHT/2), Z0, 0, 180, 0])
+            print(p)
+            movel(p, vel=VELOCITY, acc=ACC)
+            positions_by_class = node.request_base_positions()
+            target_class_ids = node.prompt_target_class_ids(positions_by_class)
+            if target_class_ids is not None:
+                node.pick_and_place_class(target_class_ids, positions_by_class)
     finally:
         node.destroy_node()
         dsr_node.destroy_node()
