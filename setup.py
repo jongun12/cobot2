@@ -45,6 +45,7 @@ setup(
             'realsense_service = cobot2.realsense2:main',
             'robot_move4 = cobot2.robot_move4:main',
             'robot_move_total = cobot2.robot_move_total:main',
+            'firebase_bridge_node = cobot2.firebase_bridge_node:main',
         ],
     },
 )

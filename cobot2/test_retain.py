@@ -458,7 +458,6 @@ def object_callback(msg):
 # =====================================================
 
 def perform_movec(base_xyz):
-
     from DSR_ROBOT2 import (
         movej,
         movel,

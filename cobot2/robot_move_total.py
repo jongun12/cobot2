@@ -4,6 +4,8 @@ import rclpy
 from od_msg.srv import SrvBasePositions
 from rclpy.node import Node
 import time
+from cobot2.test_retain import perform_movec
+from std_msgs.msg import Int32
 
 SERVICE_TIMEOUT_SEC = 15.0
 
@@ -32,6 +34,12 @@ class RobotMoveNode(Node):
             SrvBasePositions,
             "get_center_base_positions",
         )
+        self.center_of_center_client = self.create_client(
+            SrvBasePositions,
+            "center_of_center_points",
+        )
+        self.db_publisher = self.create_publisher(Int32, 'trash_count', 10)
+
         from DSR_ROBOT2 import movej
         gripper.open_gripper()  # 그리퍼 열기
         while gripper.get_status()[0]:
@@ -83,6 +91,44 @@ class RobotMoveNode(Node):
                 )
 
         return positions_by_class
+
+    def request_center_of_centers_xyz(self):
+        while not self.center_of_center_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Waiting for center_of_center_points service...")
+
+        self.get_logger().info("Calling center_of_center_points service...")
+        future = self.center_of_center_client.call_async(SrvBasePositions.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
+
+        if not future.done():
+            future.cancel()
+            self.get_logger().error(
+                "Timed out waiting for center_of_center_points "
+                f"after {SERVICE_TIMEOUT_SEC:.1f}s."
+            )
+            return None
+
+        if future.result() is None:
+            self.get_logger().error("Failed to call center_of_center_points service.")
+            return None
+
+        response = future.result()
+        if not response.success:
+            self.get_logger().warn(response.message)
+            return None
+
+        positions = self._parse_base_positions_response(response)
+        if not positions:
+            self.get_logger().warn("center_of_center_points returned no positions.")
+            return None
+
+        position = positions[0]
+        center_xyz = [position["x"], position["y"], position["z"]]
+        self.get_logger().info(
+            "Center of centers xyz=[%.3f, %.3f, %.3f]"
+            % (center_xyz[0], center_xyz[1], center_xyz[2])
+        )
+        return center_xyz
 
     def prompt_target_class_ids(self, positions_by_class):
         if not positions_by_class:
@@ -186,6 +232,9 @@ class RobotMoveNode(Node):
             if position["class_id"] != 0:
                 # 물체에 가까이 이동 ~ 분리수거 통 위
                 self.pick_and_place_target(position["class_id"], target_pos)
+                trash_count_msg = Int32()
+                trash_count_msg.data = position["class_id"]
+                self.db_publisher.publish(trash_count_msg)
             else:
                 self.side_pick_and_place_target(position["class_id"], target_pos)
             
@@ -460,6 +509,12 @@ def main(args=None):
         WIDTH = 200
         HIGHT = 150
         target_class_ids = node.prompt_target_class_ids_before_scan()
+        center_xyz = node.request_center_of_centers_xyz()
+        if center_xyz is not None:
+            perform_movec(center_xyz)
+        gripper.open_gripper()  # 그리퍼 열기
+        while gripper.get_status()[0]:
+            time.sleep(0.1)
         for i in range(4):
             p = posx([CENTER_POINT[0] + (-WIDTH/2 if i%2==0 else WIDTH/2), CENTER_POINT[1] + (HIGHT/2 if i//2==0 else -HIGHT/2), Z0, 0, 180, 0])
             print(p)

@@ -165,7 +165,72 @@ class DetectCalPosService(Node):
 
     def handle_center_of_center_points(self, request, response):
         self.get_logger().info("center_of_center_points request received.")
-        return self._handle_center_detection(response)
+        frame, depth_image, camera_info = self.get_frames_once()
+        if frame is None or depth_image is None or camera_info is None:
+            self._set_empty_base_position_response(
+                response,
+                "Failed to receive color image, depth image, or camera info.",
+            )
+            return response
+
+        _, detections = self.detect_from_color_image(color_image=frame)
+        self._publish_detection_image(frame, [], detections)
+        if not detections:
+            self._set_empty_base_position_response(
+                response,
+                "No objects detected.",
+            )
+            return response
+
+        center_xs = []
+        center_ys = []
+        for detection in detections:
+            cx, cy = self._get_box_center(detection["box"])
+            center_xs.append(cx)
+            center_ys.append(cy)
+
+        avg_x = int(round(float(np.mean(center_xs))))
+        avg_y = int(round(float(np.mean(center_ys))))
+
+        robot_posx = self.request_robot_posx()
+        if robot_posx is None:
+            self._set_empty_base_position_response(
+                response,
+                "Failed to receive current robot posx.",
+            )
+            return response
+
+        xyz = self.get_xyz_from_pixel(
+            avg_x,
+            avg_y,
+            depth_image=depth_image,
+            camera_info=camera_info,
+            robot_posx=robot_posx,
+        )
+        if xyz is None:
+            self._set_empty_base_position_response(
+                response,
+                "Failed to calculate center-of-centers xyz.",
+            )
+            return response
+
+        x, y, z = xyz
+        position = {
+            "box": [float(avg_x), float(avg_y), float(avg_x), float(avg_y)],
+            "class_id": -1,
+            "x": x,
+            "y": y,
+            "z": z,
+            "rx": 0.0,
+            "ry": 180.0,
+            "rz": 0.0,
+        }
+        self._set_base_position_response(
+            response,
+            [position],
+            f"Calculated center of {len(detections)} object centers.",
+        )
+        return response
 
     def handle_center_object_points(self, request, response):
         self.get_logger().info("center_object_points request received.")
