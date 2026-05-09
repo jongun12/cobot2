@@ -8,10 +8,6 @@ resource_files = [
     path for path in glob(os.path.join('resource', '*'))
     if os.path.isfile(path) and os.path.basename(path) != package_name
 ]
-model_files = [
-    path for path in ['yoloe-26n-seg.pt']
-    if os.path.isfile(path)
-]
 
 setup(
     name=package_name,
@@ -21,7 +17,6 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name), model_files),
         (os.path.join('share', package_name, 'resource'), resource_files),
     ],
     install_requires=['setuptools'],
