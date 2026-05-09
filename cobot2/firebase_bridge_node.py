@@ -1,7 +1,10 @@
+import os
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32
 from std_srvs.srv import Trigger
+from dsr_msgs2.srv import MoveStop
 
 # Firebase Admin SDK 임포트
 import firebase_admin
@@ -11,21 +14,30 @@ from ament_index_python.packages import get_package_share_directory
 
 PACKAGE_NAME = "cobot2"
 PACKAGE_PATH = get_package_share_directory(PACKAGE_NAME)
+DEFAULT_KEY_PATH = os.path.join(PACKAGE_PATH, "resource", "serviceAccountKey.json")
+ROBOT_ID = "dsr01"
 
 class FirebaseBridgeNode(Node):
     def __init__(self):
         super().__init__('firebase_bridge_node')
         
         # 1. Firebase 초기화
-        # 주의: 다운로드 받은 JSON 키 파일의 실제 절대 경로로 변경하세요.
-        key_path = f'{PACKAGE_PATH}/serviceAccountKey.json'
-        key_path = '/home/kim/cobot_ws/src/cobot2/resource/serviceAccountKey.json'
+        key_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY", DEFAULT_KEY_PATH)
+        if not os.path.exists(key_path):
+            self.get_logger().error(
+                f'Firebase 서비스 계정 키 파일을 찾을 수 없습니다: {key_path}'
+            )
+            self.get_logger().error(
+                'resource/serviceAccountKey.json에 두거나 '
+                'FIREBASE_SERVICE_ACCOUNT_KEY 환경변수로 경로를 지정하세요.'
+            )
+            return
         
         try:
             cred = credentials.Certificate(key_path)
             firebase_admin.initialize_app(cred)
             self.db = firestore.client()
-            self.get_logger().info('Firebase 초기화 성공!')
+            self.get_logger().info(f'Firebase 초기화 성공: {key_path}')
         except Exception as e:
             self.get_logger().error(f'Firebase 초기화 실패: {e}')
             return
@@ -34,6 +46,17 @@ class FirebaseBridgeNode(Node):
         self.start_condition_ref = self.db.collection('start').document('condition')
         self.cached_flag = 0
         self.last_start_condition = None
+        self.last_emergency_stop = None
+        self.publisher = self.create_publisher(Int32, 'start_condition', 10)
+        self.emergency_stop_publisher = self.create_publisher(
+            Int32,
+            'emergency_stop',
+            10,
+        )
+        self.move_stop_client = self.create_client(
+            MoveStop,
+            f'/{ROBOT_ID}/motion/move_stop',
+        )
         self.flag_watch = self.trash_doc_ref.on_snapshot(self.flag_snapshot_callback)
         self.start_watch = self.start_condition_ref.on_snapshot(
             self.start_condition_snapshot_callback
@@ -60,7 +83,6 @@ class FirebaseBridgeNode(Node):
             'is_trash_full',
             self.handle_get_flag_service
         )
-        self.publisher = self.create_publisher(Int32, 'start_condition', 10)
 
     def start_condition_snapshot_callback(self, doc_snapshot, changes, read_time):
         for doc in doc_snapshot:
@@ -70,14 +92,34 @@ class FirebaseBridgeNode(Node):
 
             data = doc.to_dict() or {}
             start_condition = int(data.get('condition', 0))
-            if self.last_start_condition == start_condition:
-                continue
+            emergency_stop = int(data.get('emergency_stop', 0))
+            if self.last_start_condition != start_condition:
+                self.last_start_condition = start_condition
+                msg = Int32()
+                msg.data = start_condition
+                self.publisher.publish(msg)
+                self.get_logger().info(f'start_condition 값 발행: {msg.data}')
 
-            self.last_start_condition = start_condition
-            msg = Int32()
-            msg.data = start_condition
-            self.publisher.publish(msg)
-            self.get_logger().info(f'start_condition 값 발행: {msg.data}')
+            if self.last_emergency_stop != emergency_stop:
+                self.last_emergency_stop = emergency_stop
+                msg = Int32()
+                msg.data = emergency_stop
+                self.emergency_stop_publisher.publish(msg)
+                self.get_logger().info(f'emergency_stop 값 발행: {msg.data}')
+                if emergency_stop == 1:
+                    self.request_move_stop()
+
+    def request_move_stop(self):
+        if not self.move_stop_client.service_is_ready():
+            self.move_stop_client.wait_for_service(timeout_sec=0.2)
+        if not self.move_stop_client.service_is_ready():
+            self.get_logger().error('/dsr01/motion/move_stop 서비스를 사용할 수 없습니다.')
+            return
+
+        request = MoveStop.Request()
+        request.stop_mode = 0
+        self.move_stop_client.call_async(request)
+        self.get_logger().warn('/dsr01/motion/move_stop 서비스를 호출했습니다.')
 
     def status_callback(self, msg):
         can, plastic, paper = 0, 0, 0

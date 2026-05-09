@@ -9,7 +9,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from od_msg.srv import SrvBasePositions
 from scipy.spatial.transform import Rotation
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import Image
 from ament_index_python.packages import get_package_share_directory
 import os
 import threading
@@ -301,28 +301,6 @@ class DetectCalPosService(Node):
             [position],
             "Calculated center object position.",
         )
-        return response
-
-    def _handle_center_detection(self, response):
-        frame, detections = self.detect_from_color_image()
-        if frame is None:
-            self._set_empty_base_position_response(response, "Color image is empty.")
-            return response
-
-        center_detection = self.select_center_detection(frame, detections)
-        center_detections = [center_detection] if center_detection is not None else []
-        self._publish_detection_image(frame, [], center_detections)
-
-        response.boxes = self._flatten_boxes(center_detections)
-        response.class_ids = [detection["class_id"] for detection in center_detections]
-        response.xs = []
-        response.ys = []
-        response.zs = []
-        response.rxs = []
-        response.rys = []
-        response.rzs = []
-        response.success = bool(center_detections)
-        response.message = f"Detected {len(center_detections)} center object."
         return response
 
     def detect_from_color_image(
