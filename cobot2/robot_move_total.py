@@ -681,7 +681,14 @@ def main(args=None):
         Z0 = 300
         HIGHT = 150
         target_class_ids = "all"
-        # Test mode: skip perform_movec stirring before the scan loop.
+        center_xyz = node.request_center_of_centers_xyz()
+        if center_xyz is not None:
+            perform_movec(center_xyz)
+        else:
+            node.get_logger().warn(
+                "center_of_center_points returned no xyz. Skipping stirring motion."
+            )
+
         gripper.open_gripper()  # 그리퍼 열기
         while gripper.get_status()[0]:
             time.sleep(0.1)
