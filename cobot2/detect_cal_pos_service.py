@@ -33,6 +33,8 @@ PCA_MASK_MORPH_KERNEL_SIZE = 5
 PCA_MIN_POINTS = 10
 PCA_LINE_SAMPLE_STEP_PX = 5
 PCA_MIN_3D_POINTS = 2
+DEBUG_IMAGE_DIR = "/tmp/cobot2_detect_cal_pos_debug"
+DEBUG_MAX_DEPTH_LABELS = 12
 
 class DetectCalPosService(Node):
     def __init__(self):
@@ -281,6 +283,7 @@ class DetectCalPosService(Node):
             color_image=frame,
             depth_image=depth_image,
             camera_info=camera_info,
+            base_xyz=xyz,
         )
         x, y, z = xyz
         position = {
@@ -685,6 +688,7 @@ class DetectCalPosService(Node):
         color_image=None,
         depth_image=None,
         camera_info=None,
+        base_xyz=None,
     ):
         if color_image is None or depth_image is None or camera_info is None:
             color_image, depth_image, camera_info = self.get_frames_once()
@@ -705,7 +709,20 @@ class DetectCalPosService(Node):
             depth_image,
             camera_info,
         )
-        return self.get_rxyz_from_angles(horizontal_angle, vertical_angle)
+        rx, ry, rz = self.get_rxyz_from_angles(horizontal_angle, vertical_angle)
+        debug_pose = None
+        if base_xyz is not None:
+            x, y, z = base_xyz
+            debug_pose = [x, y, z, rx, ry, rz]
+        self._save_orientation_debug_image(
+            color_image,
+            depth_image,
+            pca_direction,
+            horizontal_angle,
+            vertical_angle,
+            debug_pose=debug_pose,
+        )
+        return rx, ry, rz
 
     def _calculate_pca_direction_from_box(self, image, box):
         height, width = image.shape[:2]
@@ -817,6 +834,185 @@ class DetectCalPosService(Node):
             return None
 
         return float(np.degrees(np.arctan2(direction[2], lateral_length)))
+
+    def _save_orientation_debug_image(
+        self,
+        color_image,
+        depth_image,
+        pca_direction,
+        horizontal_angle,
+        vertical_angle,
+        debug_pose=None,
+    ):
+        x1, y1, x2, y2, cx, cy, vx, vy, binary_mask = pca_direction
+        pixel_points = self._sample_pca_line_pixels(
+            binary_mask,
+            x1,
+            y1,
+            x2,
+            y2,
+            cx,
+            cy,
+            vx,
+            vy,
+        )
+
+        annotated = color_image.copy()
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        self._draw_pca_line(annotated, cx, cy, vx, vy, (0, 255, 255))
+
+        valid_depths = []
+        for px, py in pixel_points:
+            depth = self._get_raw_depth(depth_image, px, py)
+            is_valid = self._is_valid_position_depth(depth)
+            color = (255, 0, 255) if is_valid else (0, 0, 255)
+            cv2.circle(annotated, (px, py), 4, color, -1)
+            if is_valid:
+                valid_depths.append((px, py, depth))
+
+        center_depth = self._get_raw_depth(depth_image, cx, cy)
+
+        self._draw_depth_labels(annotated, valid_depths)
+        self._draw_orientation_text(
+            annotated,
+            horizontal_angle,
+            vertical_angle,
+            len(valid_depths),
+            center_depth,
+            debug_pose,
+        )
+
+        mask_panel = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
+        self._draw_pca_line(mask_panel, cx - x1, cy - y1, vx, vy, (0, 255, 255))
+        for px, py in pixel_points:
+            roi_x = px - x1
+            roi_y = py - y1
+            depth = self._get_raw_depth(depth_image, px, py)
+            color = (255, 0, 255) if self._is_valid_position_depth(depth) else (0, 0, 255)
+            cv2.circle(mask_panel, (roi_x, roi_y), 3, color, -1)
+
+        mask_panel = self._resize_debug_panel(mask_panel, annotated.shape[0])
+        debug_image = np.hstack([annotated, mask_panel])
+
+        os.makedirs(DEBUG_IMAGE_DIR, exist_ok=True)
+        stamp = self.get_clock().now().nanoseconds
+        debug_path = os.path.join(DEBUG_IMAGE_DIR, f"orientation_debug_{stamp}.png")
+        latest_path = os.path.join(DEBUG_IMAGE_DIR, "latest_orientation_debug.png")
+        cv2.imwrite(debug_path, debug_image)
+        cv2.imwrite(latest_path, debug_image)
+        self.get_logger().info(f"Saved orientation debug image: {debug_path}")
+
+    def _draw_pca_line(self, image, cx, cy, vx, vy, color):
+        height, width = image.shape[:2]
+        length = int(np.hypot(width, height) / 2)
+        x1 = int(round(cx - vx * length))
+        y1 = int(round(cy - vy * length))
+        x2 = int(round(cx + vx * length))
+        y2 = int(round(cy + vy * length))
+        cv2.line(image, (x1, y1), (x2, y2), color, 2)
+        cv2.circle(image, (int(cx), int(cy)), 5, (0, 0, 255), -1)
+
+    def _draw_depth_labels(self, image, valid_depths):
+        if not valid_depths:
+            return
+
+        step = max(1, len(valid_depths) // DEBUG_MAX_DEPTH_LABELS)
+        for index, (px, py, depth) in enumerate(valid_depths):
+            if index % step != 0:
+                continue
+
+            cv2.putText(
+                image,
+                f"{depth:.3f}",
+                (px + 6, py - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                image,
+                f"{depth:.3f}",
+                (px + 6, py - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    def _draw_orientation_text(
+        self,
+        image,
+        horizontal_angle,
+        vertical_angle,
+        valid_depth_count,
+        center_depth=None,
+        debug_pose=None,
+    ):
+        horizontal_text = "horizontal: n/a"
+        if horizontal_angle is not None:
+            horizontal_text = f"horizontal: {horizontal_angle:.2f} deg"
+
+        vertical_text = "vertical: n/a"
+        if vertical_angle is not None:
+            vertical_text = f"vertical: {vertical_angle:.2f} deg"
+
+        lines = [
+            horizontal_text,
+            vertical_text,
+            f"valid depth samples: {valid_depth_count}",
+        ]
+        if center_depth is not None:
+            lines.append(f"center depth: {center_depth:.3f}")
+        if debug_pose is not None:
+            x, y, z, rx, ry, rz = debug_pose
+            lines.extend(
+                [
+                    f"pos xyz: {x:.2f}, {y:.2f}, {z:.2f}",
+                    f"pos rxyz: {rx:.2f}, {ry:.2f}, {rz:.2f}",
+                ]
+            )
+        x = 12
+        y = 28
+        for line in lines:
+            cv2.putText(
+                image,
+                line,
+                (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                4,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                image,
+                line,
+                (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            y += 30
+
+    def _resize_debug_panel(self, image, target_height):
+        height, width = image.shape[:2]
+        if height <= 0 or width <= 0:
+            return image
+
+        scale = target_height / float(height)
+        target_width = max(1, int(round(width * scale)))
+        return cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_NEAREST)
+
+    def _get_raw_depth(self, depth_image, x, y):
+        height, width = depth_image.shape[:2]
+        if x < 0 or y < 0 or x >= width or y >= height:
+            return None
+        return float(depth_image[y, x])
 
     def _sample_pca_line_pixels(
         self,

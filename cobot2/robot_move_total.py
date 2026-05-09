@@ -6,8 +6,10 @@ from rclpy.node import Node
 import time
 from cobot2.test_retain import perform_movec
 from std_msgs.msg import Int32
+from std_srvs.srv import Trigger
 
 SERVICE_TIMEOUT_SEC = 15.0
+TRASH_FULL_CHECK_PERIOD_SEC = 2.0
 
 ROBOT_ID = "dsr01"
 ROBOT_MODEL = "m0609"
@@ -39,12 +41,40 @@ class RobotMoveNode(Node):
             "center_of_center_points",
         )
         self.db_publisher = self.create_publisher(Int32, 'trash_count', 10)
+        self.task_complete_publisher = self.create_publisher(Int32, 'task_complete', 10)
+        self.flag_client = self.create_client(
+            Trigger,
+            'is_trash_full',
+        )
+        self.start_requested = False
+        self.start_subscription = self.create_subscription(
+            Int32,
+            'start_condition',
+            self.start_condition_callback,
+            10,
+        )
 
         from DSR_ROBOT2 import movej
         gripper.open_gripper()  # 그리퍼 열기
         while gripper.get_status()[0]:
             time.sleep(0.1)
         movej(P0, vel=VELOCITY, acc=ACC) # 초기 위치로 이동
+
+    def start_condition_callback(self, msg):
+        if msg.data == 1:
+            self.start_requested = True
+            self.get_logger().info("Received start_condition=1.")
+
+    def wait_for_start_condition(self):
+        self.get_logger().info("Waiting for start_condition=1...")
+        while rclpy.ok() and not self.start_requested:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+    def publish_task_complete(self):
+        msg = Int32()
+        msg.data = 1
+        self.task_complete_publisher.publish(msg)
+        self.get_logger().info("Published task_complete=1.")
 
     def request_base_positions(self):
         while not self.base_positions_client.wait_for_service(timeout_sec=1.0):
@@ -59,16 +89,16 @@ class RobotMoveNode(Node):
             self.get_logger().error(
                 f"Timed out waiting for get_base_positions after {SERVICE_TIMEOUT_SEC:.1f}s."
             )
-            return []
+            return {}
 
         if future.result() is None:
             self.get_logger().error("Failed to call get_base_positions service.")
-            return []
+            return {}
 
         response = future.result()
         if not response.success:
             self.get_logger().warn(response.message)
-            return []
+            return {}
 
         positions = self._parse_base_positions_response(response)
         positions_by_class = self._group_positions_by_class_id(positions)
@@ -235,9 +265,48 @@ class RobotMoveNode(Node):
                 trash_count_msg = Int32()
                 trash_count_msg.data = position["class_id"]
                 self.db_publisher.publish(trash_count_msg)
+                self.wait_until_trash_not_full()
             else:
                 self.side_pick_and_place_target(position["class_id"], target_pos)
-            
+
+    def request_trash_full_flag(self):
+        while not self.flag_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Waiting for is_trash_full service...")
+
+        future = self.flag_client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
+
+        if not future.done():
+            future.cancel()
+            self.get_logger().error(
+                f"Timed out waiting for is_trash_full service "
+                f"after {SERVICE_TIMEOUT_SEC:.1f}s."
+            )
+            return None
+
+        if future.result() is None:
+            self.get_logger().error("Failed to call is_trash_full service.")
+            return None
+
+        response = future.result()
+        if not response.success:
+            self.get_logger().warn(response.message)
+            return None
+
+        return response.message
+
+    def wait_until_trash_not_full(self):
+        from DSR_ROBOT2 import movej
+        while True:
+            flag = self.request_trash_full_flag()
+            if flag != '1':
+                return
+            movej(P0, vel=VELOCITY, acc=ACC) # 초기 위치로 이동
+            self.get_logger().warn(
+                "Trash bin is full. Waiting until Firebase flag becomes 0..."
+            )
+            time.sleep(TRASH_FULL_CHECK_PERIOD_SEC)
+
     def pick_and_place_target(self, class_id, target_pos):
         from DSR_ROBOT2 import movel, movej, mwait, posx, DR_MV_MOD_REL, trans, DR_TOOL
 
@@ -262,11 +331,12 @@ class RobotMoveNode(Node):
 
         close_picture_pose = list(target_pos)
         close_picture_pose[2] += 40
-        close_picture_pose[1] += -70  # 사진 찍는 위치로 이동 (조정 필요)
+        close_picture_pose[1] += -85  # 사진 찍는 위치로 이동 (조정 필요)
         print("1. Moving to close picture pose...")
         movel(close_picture_pose, vel=VELOCITY, acc=ACC) # 사진 찍는 위치로 이동
         print("Taking picture and getting more accurate position...")
         # 사진 찍고 더 정확한 위치 받아오기 + box 정보
+        center_position = None
         self.center_base_positions_client.wait_for_service()
         future = self.center_base_positions_client.call_async(SrvBasePositions.Request())
         rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
@@ -306,25 +376,33 @@ class RobotMoveNode(Node):
                         "get_center_base_positions returned no positions."
                     )
 
+        if center_position is None:
+            self.get_logger().warn(
+                "Cannot continue pick: center object was not detected."
+            )
+            return
+
         if center_position["class_id"] == 1:  # label x
-            target_pos[2] = 100  # 정확한 위치 (조정 필요)
+            target_pos[2] = 80  # 정확한 위치 (조정 필요)
         elif center_position["class_id"] == 2:  # label o
-            target_pos[2] = 100  # 정확한 위치 (조정 필요)
+            target_pos[2] = 80  # 정확한 위치 (조정 필요)
         else:
-            target_pos[2] += -70  # 정확한 위치 (조정 필요)
+            target_pos[2] += -80  # 정확한 위치 (조정 필요)
 
         # pick_pos_up = list(target_pos)
         # pick_pos_up[2] += 100  # 대상 위치 위로 이동
         pick_up = list(target_pos)
-        pick_up[2] += 150  # 대상 위치 위로 이동
+        pick_up[2] += 100  # 대상 위치 위로 이동
         print("2. Moving to pick position...")
         movel(pick_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
+        # movel([-10,0,0,0,0,0], vel=VELOCITY, acc=ACC, ref=DR_TOOL)
 
         print("3. Moving to target position...")
-        movel(target_pos, vel=VELOCITY, acc=ACC) # 대상 위치로 이동
+        movel([0,0,-100,0,0,0], vel=VELOCITY, acc=ACC, mod=DR_MV_MOD_REL) # 대상 위치로 이동
         mwait()
+         # 대상 위치로 이동
 
-        gripper.close_gripper(force_val=80)  # 그리퍼 닫기
+        gripper.close_gripper(force_val=100)  # 그리퍼 닫기
         while gripper.get_status()[0]:
             time.sleep(0.1)
 
@@ -359,6 +437,7 @@ class RobotMoveNode(Node):
 
         # 사진 찍고 더 정확한 위치 받아오기 + box 정보
         print("Taking picture and getting more accurate position...")
+        center_position = None
         self.center_base_positions_client.wait_for_service()
         future = self.center_base_positions_client.call_async(SrvBasePositions.Request())
         rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
@@ -402,6 +481,12 @@ class RobotMoveNode(Node):
 
 
         # ==================================================================================
+        if center_position is None:
+            self.get_logger().warn(
+                "Cannot continue side pick: center object was not detected."
+            )
+            return
+
         if center_position["class_id"] == 1:  # label x
             thrash_bin_pos = [300, -300, 200, 155.1, 179.8, 155.4]
         elif center_position["class_id"] == 2:  # label o
@@ -504,29 +589,44 @@ def main(args=None):
     node = RobotMoveNode()
     try:
         from DSR_ROBOT2 import movel, posx, movej
-        CENTER_POINT = (367.6, -20.0)
+        node.wait_for_start_condition()
+        CENTER_POINT = (400.0, -50.0)
         Z0 = 300
         WIDTH = 200
         HIGHT = 150
-        target_class_ids = node.prompt_target_class_ids_before_scan()
-        center_xyz = node.request_center_of_centers_xyz()
-        if center_xyz is not None:
-            perform_movec(center_xyz)
+        target_class_ids = "all"
+        # Test mode: skip perform_movec stirring before the scan loop.
         gripper.open_gripper()  # 그리퍼 열기
         while gripper.get_status()[0]:
             time.sleep(0.1)
-        for i in range(4):
-            p = posx([CENTER_POINT[0] + (-WIDTH/2 if i%2==0 else WIDTH/2), CENTER_POINT[1] + (HIGHT/2 if i//2==0 else -HIGHT/2), Z0, 0, 180, 0])
-            print(p)
-            movel(p, vel=VELOCITY, acc=ACC)
-            positions_by_class = node.request_base_positions()
-            if target_class_ids is not None:
-                current_class_ids = (
-                    sorted(positions_by_class.keys())
-                    if target_class_ids == "all"
-                    else target_class_ids
+        while True:
+            detected_object_count = 0
+            for i in range(4):
+                p = posx([CENTER_POINT[0] + (-WIDTH/2 if i%2==0 else WIDTH/2), CENTER_POINT[1] + (HIGHT/2 if i//2==0 else -HIGHT/2), Z0, 0, 180, 0])
+                print(p)
+                movel(p, vel=VELOCITY, acc=ACC)
+                positions_by_class = node.request_base_positions()
+                detected_object_count += sum(
+                    len(class_positions)
+                    for class_positions in positions_by_class.values()
                 )
-                node.pick_and_place_class(current_class_ids, positions_by_class)
+                if target_class_ids is not None:
+                    current_class_ids = (
+                        sorted(positions_by_class.keys())
+                        if target_class_ids == "all"
+                        else target_class_ids
+                    )
+                    if not current_class_ids:
+                        node.get_logger().warn("No detected classes in this scan area.")
+                        continue
+                    node.pick_and_place_class(current_class_ids, positions_by_class)
+
+            if detected_object_count == 0:
+                node.get_logger().info(
+                    "No objects detected in all 4 scan areas. Stopping."
+                )
+                node.publish_task_complete()
+                break
         movej(P0, vel=VELOCITY, acc=ACC) # 초기 위치로 이동
     finally:
         node.destroy_node()

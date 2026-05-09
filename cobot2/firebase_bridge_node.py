@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32
+from std_srvs.srv import Trigger
 
 # Firebase Admin SDK 임포트
 import firebase_admin
@@ -29,6 +30,15 @@ class FirebaseBridgeNode(Node):
             self.get_logger().error(f'Firebase 초기화 실패: {e}')
             return
 
+        self.trash_doc_ref = self.db.collection('trash_limit').document('TvQe4stbmyYjewO8tKck')
+        self.start_condition_ref = self.db.collection('start').document('condition')
+        self.cached_flag = 0
+        self.last_start_condition = None
+        self.flag_watch = self.trash_doc_ref.on_snapshot(self.flag_snapshot_callback)
+        self.start_watch = self.start_condition_ref.on_snapshot(
+            self.start_condition_snapshot_callback
+        )
+
         # 2. ROS 2 Subscriber 생성
         # 'robot_status'라는 토픽에서 String 메시지를 받습니다.
         self.subscription = self.create_subscription(
@@ -37,7 +47,37 @@ class FirebaseBridgeNode(Node):
             self.status_callback,
             10
         )
+        self.task_complete_subscription = self.create_subscription(
+            Int32,
+            'task_complete',
+            self.task_complete_callback,
+            10
+        )
         self.get_logger().info('브릿지 노드가 실행되었습니다. 데이터를 대기 중입니다...')
+
+        self.get_flag_service = self.create_service(
+            Trigger,
+            'is_trash_full',
+            self.handle_get_flag_service
+        )
+        self.publisher = self.create_publisher(Int32, 'start_condition', 10)
+
+    def start_condition_snapshot_callback(self, doc_snapshot, changes, read_time):
+        for doc in doc_snapshot:
+            if not doc.exists:
+                self.get_logger().warn('start/condition 문서가 존재하지 않습니다.')
+                continue
+
+            data = doc.to_dict() or {}
+            start_condition = int(data.get('condition', 0))
+            if self.last_start_condition == start_condition:
+                continue
+
+            self.last_start_condition = start_condition
+            msg = Int32()
+            msg.data = start_condition
+            self.publisher.publish(msg)
+            self.get_logger().info(f'start_condition 값 발행: {msg.data}')
 
     def status_callback(self, msg):
         can, plastic, paper = 0, 0, 0
@@ -59,8 +99,7 @@ class FirebaseBridgeNode(Node):
         # 3. Firebase Firestore에 데이터 쓰기
         try:
             # 'trash_limit' 컬렉션 안의 'first_task' 문서에 데이터를 업데이트합니다.
-            doc_ref = self.db.collection('trash_limit').document('TvQe4stbmyYjewO8tKck')
-            doc_ref.set({
+            self.trash_doc_ref.set({
                 'can': firestore.Increment(can),
                 'plastic': firestore.Increment(plastic),
                 'paper': firestore.Increment(paper)
@@ -69,6 +108,32 @@ class FirebaseBridgeNode(Node):
             self.get_logger().info('Firebase에 데이터 전송 완료')
         except Exception as e:
             self.get_logger().error(f'Firebase 전송 오류: {e}')
+
+    def task_complete_callback(self, msg):
+        if msg.data != 1:
+            return
+
+        try:
+            self.start_condition_ref.set({'condition': 0}, merge=True)
+            self.get_logger().info('작업 완료: start/condition.condition 값을 0으로 변경했습니다.')
+        except Exception as e:
+            self.get_logger().error(f'start_condition 초기화 오류: {e}')
+
+    def flag_snapshot_callback(self, doc_snapshot, changes, read_time):
+        for doc in doc_snapshot:
+            if not doc.exists:
+                self.get_logger().warn('Firebase flag 문서가 존재하지 않습니다.')
+                continue
+
+            data = doc.to_dict()
+            self.cached_flag = int(data.get('flag', 0))
+            self.get_logger().info(f'Firebase flag 캐시 업데이트: {self.cached_flag}')
+
+    def handle_get_flag_service(self, request, response):
+        response.success = True
+        response.message = str(self.cached_flag)
+        self.get_logger().info(f'캐시된 flag 값 반환: {self.cached_flag}')
+        return response
 
 
 def main(args=None):
