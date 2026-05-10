@@ -12,6 +12,8 @@ from dsr_msgs2.srv import MoveStop
 SERVICE_TIMEOUT_SEC = 15.0
 TRASH_FULL_CHECK_PERIOD_SEC = 2.0
 EMERGENCY_STOP_CHECK_PERIOD_SEC = 0.1
+PICK_Z_MIN = 50.0
+MIN_GRIPPED_WIDTH_MM = 15.0
 
 ROBOT_ID = "dsr01"
 ROBOT_MODEL = "m0609"
@@ -384,6 +386,20 @@ class RobotMoveNode(Node):
     def is_object_gripped(self):
         status = gripper.get_status()
         width = gripper.get_width()
+        if self._is_gripper_safety_active(status):
+            self.get_logger().error(
+                f"Gripper safety is active. Stopping robot. status={status}"
+            )
+            self.emergency_stopped = True
+            self.request_move_stop()
+            return False
+
+        if width <= MIN_GRIPPED_WIDTH_MM:
+            self.get_logger().warn(
+                f"Grip failed. width={width:.1f}mm <= {MIN_GRIPPED_WIDTH_MM:.1f}mm"
+            )
+            return False
+
         if status[1]:
             self.get_logger().info(f"Grip detected. width={width:.1f}mm")
             return True
@@ -466,6 +482,7 @@ class RobotMoveNode(Node):
             target_pos[2] = 80  # 정확한 위치 (조정 필요)
         else:
             target_pos[2] += -80  # 정확한 위치 (조정 필요)
+        target_pos = self._limit_pick_z_min(target_pos)
 
         # pick_pos_up = list(target_pos)
         # pick_pos_up[2] += 100  # 대상 위치 위로 이동
@@ -665,6 +682,19 @@ class RobotMoveNode(Node):
             position["ry"],
             position["rz"],
         ]
+
+    def _limit_pick_z_min(self, pose):
+        limited_pose = list(pose)
+        if limited_pose[2] <= PICK_Z_MIN:
+            self.get_logger().info(
+                "Limiting pick z from %.3f to %.3f."
+                % (limited_pose[2], PICK_Z_MIN)
+            )
+            limited_pose[2] = PICK_Z_MIN
+        return limited_pose
+
+    def _is_gripper_safety_active(self, status):
+        return any(status[2:7])
     
 
 
@@ -683,7 +713,8 @@ def main(args=None):
         target_class_ids = "all"
         center_xyz = node.request_center_of_centers_xyz()
         if center_xyz is not None:
-            perform_movec(center_xyz)
+            # perform_movec(center_xyz)
+            ...
         else:
             node.get_logger().warn(
                 "center_of_center_points returned no xyz. Skipping stirring motion."
