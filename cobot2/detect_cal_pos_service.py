@@ -33,6 +33,7 @@ PCA_MASK_MORPH_KERNEL_SIZE = 5
 PCA_MIN_POINTS = 10
 PCA_LINE_SAMPLE_STEP_PX = 5
 PCA_MIN_3D_POINTS = 2
+VERTICAL_ANGLE_RXYZ_LIMIT_DEG = 45.0
 DEBUG_IMAGE_DIR = "/tmp/cobot2_detect_cal_pos_debug"
 DEBUG_MAX_DEPTH_LABELS = 12
 
@@ -687,7 +688,18 @@ class DetectCalPosService(Node):
             depth_image,
             camera_info,
         )
-        rx, ry, rz = self.get_rxyz_from_angles(horizontal_angle, vertical_angle)
+        if (
+            vertical_angle is not None
+            and abs(vertical_angle) > VERTICAL_ANGLE_RXYZ_LIMIT_DEG
+        ):
+            self.get_logger().info(
+                "Vertical angle %.2f deg exceeds %.2f deg. "
+                "Using default rxyz."
+                % (vertical_angle, VERTICAL_ANGLE_RXYZ_LIMIT_DEG)
+            )
+            rx, ry, rz = self.get_rxyz_from_angles()
+        else:
+            rx, ry, rz = self.get_rxyz_from_angles(horizontal_angle, vertical_angle)
         debug_pose = None
         if base_xyz is not None:
             x, y, z = base_xyz
