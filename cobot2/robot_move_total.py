@@ -12,6 +12,7 @@ from dsr_msgs2.srv import MoveStop
 SERVICE_TIMEOUT_SEC = 15.0
 TRASH_FULL_CHECK_PERIOD_SEC = 2.0
 EMERGENCY_STOP_CHECK_PERIOD_SEC = 0.1
+VOICE_PAUSE_CHECK_PERIOD_SEC = 0.1
 PICK_Z_MIN = 50.0
 MIN_GRIPPED_WIDTH_MM = 15.0
 
@@ -56,6 +57,9 @@ class RobotMoveNode(Node):
         )
         self.start_requested = False
         self.emergency_stopped = False
+        self.voice_paused = False
+        self.voice_target_class_ids = "all"
+        self.restart_scan_requested = False
         self.start_subscription = self.create_subscription(
             Int32,
             'start_condition',
@@ -68,10 +72,22 @@ class RobotMoveNode(Node):
             self.emergency_stop_callback,
             10,
         )
+        self.declare_parameter("voice_command_topic", "voice_command")
+        voice_command_topic = (
+            self.get_parameter("voice_command_topic").get_parameter_value().string_value
+        )
+        self.voice_command_subscription = self.create_subscription(
+            Int32,
+            voice_command_topic,
+            self.voice_command_callback,
+            10,
+        )
+        self.get_logger().info(
+            f"Listening for voice commands on '{voice_command_topic}'."
+        )
 
         gripper.open_gripper()  # 그리퍼 열기
-        while gripper.get_status()[0]:
-            time.sleep(0.1)
+        self.wait_for_gripper_motion()
         self.safe_movej(P0, vel=VELOCITY, acc=ACC) # 초기 위치로 이동
 
     def start_condition_callback(self, msg):
@@ -95,6 +111,29 @@ class RobotMoveNode(Node):
                 self.get_logger().info("Emergency stop released.")
             self.emergency_stopped = False
 
+    def voice_command_callback(self, msg):
+        command = int(msg.data)
+        if command == 0:
+            if not self.voice_paused:
+                self.get_logger().warn("Voice command pause requested.")
+            self.voice_paused = True
+            self.request_move_stop()
+        elif command == 1:
+            if self.voice_paused:
+                self.get_logger().info("Voice command resume requested.")
+            self.voice_paused = False
+        elif 2 <= command <= 7:
+            class_id = command - 2
+            self.voice_target_class_ids = [class_id]
+            self.restart_scan_requested = True
+            self.voice_paused = False
+            self.get_logger().warn(
+                f"Voice command selected class_id={class_id}. Restarting scan."
+            )
+            self.request_move_stop()
+        else:
+            self.get_logger().warn(f"Ignoring unknown voice command: {command}")
+
     def request_move_stop(self):
         if not self.move_stop_client.service_is_ready():
             self.move_stop_client.wait_for_service(timeout_sec=0.2)
@@ -113,22 +152,48 @@ class RobotMoveNode(Node):
             )
             rclpy.spin_once(self, timeout_sec=EMERGENCY_STOP_CHECK_PERIOD_SEC)
 
+    def wait_while_voice_paused(self):
+        while rclpy.ok() and self.voice_paused:
+            self.get_logger().warn(
+                "Voice pause is active. Waiting for voice command 1..."
+            )
+            rclpy.spin_once(self, timeout_sec=VOICE_PAUSE_CHECK_PERIOD_SEC)
+
+    def wait_until_motion_allowed(self):
+        self.wait_while_emergency_stopped()
+        self.wait_while_voice_paused()
+
+    def should_restart_scan(self):
+        return self.restart_scan_requested
+
+    def consume_restart_scan_request(self):
+        if not self.restart_scan_requested:
+            return False
+
+        self.restart_scan_requested = False
+        self.get_logger().info("Restarting scan from the beginning.")
+        return True
+
     def safe_movel(self, *args, **kwargs):
         from DSR_ROBOT2 import movel
 
-        self.wait_while_emergency_stopped()
+        self.wait_until_motion_allowed()
+        if self.should_restart_scan():
+            return None
         result = movel(*args, **kwargs)
         rclpy.spin_once(self, timeout_sec=0.0)
-        self.wait_while_emergency_stopped()
+        self.wait_until_motion_allowed()
         return result
 
     def safe_movej(self, *args, **kwargs):
         from DSR_ROBOT2 import movej
 
-        self.wait_while_emergency_stopped()
+        self.wait_until_motion_allowed()
+        if self.should_restart_scan():
+            return None
         result = movej(*args, **kwargs)
         rclpy.spin_once(self, timeout_sec=0.0)
-        self.wait_while_emergency_stopped()
+        self.wait_until_motion_allowed()
         return result
 
     def publish_task_complete(self):
@@ -305,6 +370,10 @@ class RobotMoveNode(Node):
             % (len(target_positions), target_class_ids)
         )
         for index, position in enumerate(target_positions, start=1):
+            self.wait_until_motion_allowed()
+            if self.should_restart_scan():
+                return False
+
             target_pos = self._position_to_pose(position)
             self.get_logger().info(
                 "Picking %d/%d: class_id=%d, pose=[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]"
@@ -331,12 +400,19 @@ class RobotMoveNode(Node):
                     trash_count_msg.data = position["class_id"]
                     self.db_publisher.publish(trash_count_msg)
                     self.wait_until_trash_not_full()
+                    if self.should_restart_scan():
+                        return False
                 else:
                     self.get_logger().warn(
                         "Pick failed. Skipping trash_count publish."
                     )
             else:
                 self.side_pick_and_place_target(position["class_id"], target_pos)
+
+            if self.should_restart_scan():
+                return False
+
+        return True
 
     def request_trash_full_flag(self):
         while not self.flag_client.wait_for_service(timeout_sec=1.0):
@@ -366,10 +442,16 @@ class RobotMoveNode(Node):
 
     def wait_until_trash_not_full(self):
         while True:
+            self.wait_until_motion_allowed()
+            if self.should_restart_scan():
+                return
+
             flag = self.request_trash_full_flag()
             if flag != '1':
                 return
             self.safe_movej(P0, vel=VELOCITY, acc=ACC) # 초기 위치로 이동
+            if self.should_restart_scan():
+                return
             self.get_logger().warn(
                 "Trash bin is full. Waiting until Firebase flag becomes 0..."
             )
@@ -377,11 +459,15 @@ class RobotMoveNode(Node):
 
     def wait_for_gripper_motion(self):
         while gripper.get_status()[0]:
-            time.sleep(0.1)
+            self.wait_until_motion_allowed()
+            if self.should_restart_scan():
+                return False
+            rclpy.spin_once(self, timeout_sec=0.1)
+        return True
 
     def close_gripper_and_wait(self, force_val=100):
         gripper.close_gripper(force_val=force_val)
-        self.wait_for_gripper_motion()
+        return self.wait_for_gripper_motion()
 
     def is_object_gripped(self):
         status = gripper.get_status()
@@ -428,6 +514,8 @@ class RobotMoveNode(Node):
         close_picture_pose[1] += -85  # 사진 찍는 위치로 이동 (조정 필요)
         print("1. Moving to close picture pose...")
         self.safe_movel(close_picture_pose, vel=VELOCITY, acc=ACC) # 사진 찍는 위치로 이동
+        if self.should_restart_scan():
+            return False
         print("Taking picture and getting more accurate position...")
         # 사진 찍고 더 정확한 위치 받아오기 + box 정보
         center_position = None
@@ -490,19 +578,26 @@ class RobotMoveNode(Node):
         pick_up[2] += 100  # 대상 위치 위로 이동
         print("2. Moving to pick position...")
         self.safe_movel(pick_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
+        if self.should_restart_scan():
+            return False
         # movel([-10,0,0,0,0,0], vel=VELOCITY, acc=ACC, ref=DR_TOOL)
 
         print("3. Moving to target position...")
         self.safe_movel([0,0,-100,0,0,0], vel=VELOCITY, acc=ACC, mod=DR_MV_MOD_REL) # 대상 위치로 이동
+        if self.should_restart_scan():
+            return False
         mwait()
          # 대상 위치로 이동
 
-        self.close_gripper_and_wait(force_val=100)
+        if not self.close_gripper_and_wait(force_val=100):
+            return False
 
         print("4. Moving up with the object...")
         pick_up = list(target_pos)
         pick_up[2] += 150  # 대상 위치 위로 이동
         self.safe_movel(pick_up, vel=VELOCITY, acc=ACC) # 대상 위치 위로 이동
+        if self.should_restart_scan():
+            return False
         if not self.is_object_gripped():
             print("============Grip failed. Moving back up and skipping this object.============")
             gripper.open_gripper()
@@ -512,9 +607,11 @@ class RobotMoveNode(Node):
         print("5. Moving to bucket position...")
         # movel(thrash_bin_pos, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
         self.safe_movej(thrash_bin_posj, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
+        if self.should_restart_scan():
+            return False
         gripper.open_gripper()  # 그리퍼 열기
-        while gripper.get_status()[0]:
-            time.sleep(0.1)
+        if not self.wait_for_gripper_motion():
+            return False
 
         print("6. Operation completed.")
         return True
@@ -533,6 +630,8 @@ class RobotMoveNode(Node):
         close_picture_pose[5] = 90
         print("1. Moving to close picture pose...")
         self.safe_movel(close_picture_pose, vel=VELOCITY, acc=ACC) # 사진 찍는 위치로 이동
+        if self.should_restart_scan():
+            return False
 
         # 사진 찍고 더 정확한 위치 받아오기 + box 정보
         print("Taking picture and getting more accurate position...")
@@ -605,14 +704,21 @@ class RobotMoveNode(Node):
         
         print("2. Moving to side position...")
         self.safe_movel(pick_pos_side, vel=VELOCITY, acc=ACC) # 대상 위치 옆으로 이동
+        if self.should_restart_scan():
+            return False
         print("3. Moving to target position...")
         self.safe_movel(target_pos, vel=VELOCITY, acc=ACC) # 대상 위치로 이동
+        if self.should_restart_scan():
+            return False
         
         print("gripping...")
-        self.close_gripper_and_wait(force_val=100)
+        if not self.close_gripper_and_wait(force_val=100):
+            return False
         
         print("4. Moving side up with the object...")
         self.safe_movel(posx([0,0,100,0,0,0]), vel=VELOCITY, acc=ACC, mod=DR_MV_MOD_REL) # 대상 위치 위로 이동
+        if self.should_restart_scan():
+            return False
         if not self.is_object_gripped():
             gripper.open_gripper()
             self.wait_for_gripper_motion()
@@ -620,10 +726,12 @@ class RobotMoveNode(Node):
 
         print("5. Moving to bucket position...")
         self.safe_movel(thrash_bin_pos, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
+        if self.should_restart_scan():
+            return False
 
         gripper.open_gripper()  # 그리퍼 열기
-        while gripper.get_status()[0]:
-            time.sleep(0.1)
+        if not self.wait_for_gripper_motion():
+            return False
 
         print("8. Operation completed.")
         return True
@@ -710,7 +818,6 @@ def main(args=None):
         CENTER_POINT = (500.0, -50.0)
         Z0 = 300
         HIGHT = 150
-        target_class_ids = "all"
         center_xyz = node.request_center_of_centers_xyz()
         if center_xyz is not None:
             # perform_movec(center_xyz)
@@ -721,15 +828,29 @@ def main(args=None):
             )
 
         gripper.open_gripper()  # 그리퍼 열기
-        while gripper.get_status()[0]:
-            time.sleep(0.1)
+        node.wait_for_gripper_motion()
         while True:
+            target_class_ids = node.voice_target_class_ids
             detected_object_count = 0
+            restart_scan = False
             for y_offset in (HIGHT / 2, -HIGHT / 2):
+                node.wait_until_motion_allowed()
+                if node.should_restart_scan():
+                    restart_scan = True
+                    break
+
                 p = posx([CENTER_POINT[0], CENTER_POINT[1] + y_offset, Z0, 0, 180, 0])
                 print(p)
                 node.safe_movel(p, vel=VELOCITY, acc=ACC)
+                if node.should_restart_scan():
+                    restart_scan = True
+                    break
+
                 positions_by_class = node.request_base_positions()
+                if node.should_restart_scan():
+                    restart_scan = True
+                    break
+
                 detected_object_count += sum(
                     len(class_positions)
                     for class_positions in positions_by_class.values()
@@ -744,6 +865,13 @@ def main(args=None):
                         node.get_logger().warn("No detected classes in this scan area.")
                         continue
                     node.pick_and_place_class(current_class_ids, positions_by_class)
+                    if node.should_restart_scan():
+                        restart_scan = True
+                        break
+
+            if restart_scan:
+                node.consume_restart_scan_request()
+                continue
 
             if detected_object_count == 0:
                 node.get_logger().info(
