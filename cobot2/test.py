@@ -136,16 +136,19 @@ def save_debug_image(image, line_count, output_dir=DEBUG_IMAGE_DIR):
 
 
 def get_realsense_color_image(timeout_sec=FRAME_TIMEOUT_SEC):
-    frame_node = RealsenseFrameNode("line_count_realsense_frame_node")
+    frame_node = RealsenseFrameNode()
     deadline = frame_node.get_clock().now().nanoseconds + int(timeout_sec * 1e9)
 
-    while rclpy.ok() and not frame_node.has_color_frame():
+    while rclpy.ok() and frame_node.color_msg is None:
         rclpy.spin_once(frame_node, timeout_sec=0.1)
         if frame_node.get_clock().now().nanoseconds >= deadline:
             frame_node.destroy_node()
             return None
 
-    color_image = frame_node.get_color_image()
+    color_image = frame_node.bridge.imgmsg_to_cv2(
+        frame_node.color_msg,
+        desired_encoding="bgr8",
+    )
     frame_node.destroy_node()
     return color_image
 
@@ -169,14 +172,17 @@ def calculate_water_level(tape_count):
 
 def main():
     rclpy.init()
-    frame_node = RealsenseFrameNode("line_count_realsense_frame_node")
+    frame_node = RealsenseFrameNode()
     try:
         while rclpy.ok():
             rclpy.spin_once(frame_node, timeout_sec=0.1)
-            color_image = frame_node.get_color_image()
-            if color_image is None:
+            if frame_node.color_msg is None:
                 continue
 
+            color_image = frame_node.bridge.imgmsg_to_cv2(
+                frame_node.color_msg,
+                desired_encoding="bgr8",
+            )
             line_count = count_lines_from_image(color_image)
             water_level = calculate_water_level(line_count)
             debug_path = save_debug_image(color_image, line_count)
