@@ -7,6 +7,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 import threading
 import time
+from cobot2.test import get_realsense_line_count
 from cobot2.test_retain import run_cluster_check_once
 from std_msgs.msg import Int32
 from std_srvs.srv import Trigger
@@ -594,6 +595,74 @@ class RobotMoveNode(Node):
         self.awaiting_disposal_command = False
         return False
 
+    def move_class_1_or_2_target(self, class_id):
+        pat1 = [584.1, 75.8, 486.1, 5.9, 93.2, 90.7]
+        pat2 = [17.65, 8.76, 81.7, 89.55, -22.71, 4.27]
+        pat3 = [741.1, 119, 474.7, 25.4, 96.5, 89.4]
+        check_pos = [9.84, -2.13, 100.49, 77.93, -4.43, 9.73]
+
+        self.wait_until_motion_allowed()
+        if self.should_restart_scan():
+            return False
+
+        self.get_logger().info(
+            f"Moving with class_id={class_id} using class 1/2 custom motion."
+        )
+        self.safe_movej(pat1, vel=VELOCITY, acc=ACC)
+        self.safe_movej(pat2, vel=VELOCITY, acc=ACC)
+        self.safe_movej(pat3, vel=VELOCITY, acc=ACC)
+        gripper.open_gripper()  # 그리퍼 열기
+        if not self.wait_for_gripper_motion():
+            return False
+        self.safe_movej(check_pos, vel=VELOCITY, acc=ACC)
+        try:
+            line_count = get_realsense_line_count()
+            self.get_logger().info(f"Detected RealSense line count: {line_count}")
+        except Exception as e:
+            line_count = 0
+            self.get_logger().error(f"Failed to detect RealSense line count: {e}")
+
+        if line_count == 0:
+            self.get_logger().info(
+                "line_count is 0. Moving to original trash bin."
+            )
+            self.safe_movej(pat3, vel=VELOCITY, acc=ACC)
+            gripper.close_gripper(force_val=100)  # 그리퍼 닫기
+            if not self.wait_for_gripper_motion():
+                return False
+            self.safe_movej(pat2, vel=VELOCITY, acc=ACC)
+            self.safe_movej(pat1, vel=VELOCITY, acc=ACC)
+            return self.move_to_trash_bin(class_id)
+        else:
+            gripper.close_gripper(force_val=100)  # 그리퍼 닫기
+            if not self.wait_for_gripper_motion():
+                return False
+            testpos1 = [24.12, 1.99, 96.4, 88.28, -18.5, 1.37]
+            self.safe_movej(testpos1, vel=VELOCITY, acc=ACC)
+            testpos1 = [20.61, 10.33, 87.06, 91.06, -15.02, -2.04]
+            self.safe_movej(testpos1, vel=VELOCITY, acc=ACC)
+            testpos1 = [20.61, 10.33, 87.06, 91.06, -19.31, -2.04]
+            self.safe_movej(testpos1, vel=VELOCITY, acc=ACC)
+            testpos1 = [20.61, 10.33, 87.06, 91.06, -6.8, -2.04]
+            self.safe_movej(testpos1, vel=VELOCITY, acc=ACC)
+            testpos1 = [20.61, 10.33, 87.06, 91.06, -19.31, -2.04]
+            self.safe_movej(testpos1, vel=VELOCITY, acc=ACC)
+            testpos1 = [20.61, 10.33, 87.06, 91.06, -6.8, -2.04]
+            self.safe_movej(testpos1, vel=VELOCITY, acc=ACC)
+            testpos1 = [20.61, 10.33, 87.05, 91.06, -49.35, -2.04]
+            self.safe_movej(testpos1, vel=VELOCITY, acc=ACC)
+            
+
+             # 테스트 위치로 이동
+
+        self.last_disposal_class_id = class_id
+
+        self.wait_until_motion_allowed()
+        if self.should_restart_scan():
+            return False
+
+        return True
+
     def pick_and_place_target(self, class_id, target_pos):
         from DSR_ROBOT2 import mwait, DR_MV_MOD_REL
 
@@ -692,7 +761,12 @@ class RobotMoveNode(Node):
             return False
 
         print("5. Moving to bucket position...")
-        if not self.move_to_trash_bin(class_id):
+        if class_id in (1, 2):
+            move_success = self.move_class_1_or_2_target(class_id)
+        else:
+            move_success = self.move_to_trash_bin(class_id)
+
+        if not move_success:
             return False
         gripper.open_gripper()  # 그리퍼 열기
         if not self.wait_for_gripper_motion():

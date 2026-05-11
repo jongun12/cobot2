@@ -173,4 +173,5 @@ if __name__ == "__main__":
     TOOLCHANGER_IP = "192.168.1.1"
     TOOLCHANGER_PORT = "502"
     gripper = RG(GRIPPER_NAME, TOOLCHANGER_IP, TOOLCHANGER_PORT)
-    gripper.close_gripper()
+    # gripper.open_gripper()
+    gripper.close_gripper(force_val=100)
