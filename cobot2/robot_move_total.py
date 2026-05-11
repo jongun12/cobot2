@@ -596,9 +596,9 @@ class RobotMoveNode(Node):
         return False
 
     def move_class_1_or_2_target(self, class_id):
-        pat1 = [584.1, 75.8, 486.1, 5.9, 93.2, 90.7]
+        pat1 = [7.92, -16.78, 110.3, 82.05, -2.01, 8.81]
         pat2 = [17.65, 8.76, 81.7, 89.55, -22.71, 4.27]
-        pat3 = [741.1, 119, 474.7, 25.4, 96.5, 89.4]
+        pat3 = [-4.36, 9.67, 84.36, 83.8, 29.81, 2.8]
         check_pos = [9.84, -2.13, 100.49, 77.93, -4.43, 9.73]
 
         self.wait_until_motion_allowed()
