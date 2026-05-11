@@ -595,10 +595,63 @@ class RobotMoveNode(Node):
         self.awaiting_disposal_command = False
         return False
 
+    def force_control(self, target_force=9.0, stop_force=0.0):
+        from DSR_ROBOT2 import (
+            DR_FC_MOD_REL,
+            DR_TOOL,
+            DR_BASE,
+            get_tool_force,
+            release_compliance_ctrl,
+            release_force,
+            set_desired_force,
+            set_ref_coord,
+            task_compliance_ctrl,
+            wait,
+        )
+
+        self.wait_until_motion_allowed()
+        if self.should_restart_scan():
+            return False
+
+        self.get_logger().info(
+            f"Starting Z force control. target={target_force}, stop={stop_force}"
+        )
+        
+        try:
+            set_ref_coord(DR_BASE)
+            task_compliance_ctrl(stx=[1000, 1000, 200, 1000,1000, 1000])
+            wait(0.5)
+            set_desired_force(
+                fd=[0, 0, -target_force, 0, 0, 0],
+                dir=[0, 0, 1, 0, 0, 0],
+                mod=DR_FC_MOD_REL,
+            )
+
+            while rclpy.ok():
+                if self.should_restart_scan():
+                    return False
+                if self.voice_paused or self.emergency_stopped:
+                    return False
+
+                force = get_tool_force(DR_BASE)
+                self.get_logger().info(f"Current tool force: x={force[0]:.2f}, y={force[1]:.2f}, z={force[2]:.2f}")
+                if force[2] >= stop_force:
+                    self.get_logger().info(f"Z force reached: {force[2]:.2f}")
+                    break
+                time.sleep(0.1)
+
+            wait(0.5)
+            return True
+        finally:
+            release_force()
+            release_compliance_ctrl()
+            set_ref_coord(0)
+
     def move_class_1_or_2_target(self, class_id):
-        pat1 = [7.92, -16.78, 110.3, 82.05, -2.01, 8.81]
-        pat2 = [17.65, 8.76, 81.7, 89.55, -22.71, 4.27]
-        pat3 = [-4.36, 9.67, 84.36, 83.8, 29.81, 2.8]
+        pat1 = [-21.53, -14.34, 103.08, 85.9, 53.75, -2.72]
+        pat2 = [-16.54, 27.75, 48.09, 82.51, 64.3, 8.57]
+        pat3 = [-15.51, 31.11, 54.07, 76.46, 66.95, 8.58]
+        pat4 = [-15.72, 29.17, 51.69, 85.81, 64.98, 6.08]
         check_pos = [9.84, -2.13, 100.49, 77.93, -4.43, 9.73]
 
         self.wait_until_motion_allowed()
@@ -609,32 +662,42 @@ class RobotMoveNode(Node):
             f"Moving with class_id={class_id} using class 1/2 custom motion."
         )
         self.safe_movej(pat1, vel=VELOCITY, acc=ACC)
+        print("Moved to pat1")
         self.safe_movej(pat2, vel=VELOCITY, acc=ACC)
-        self.safe_movej(pat3, vel=VELOCITY, acc=ACC)
+        print("Moved to pat2")
+        self.safe_movej(pat4, vel=30, acc=ACC)
+        print("Moved to pat4")
+        time.sleep(0.5)  # Ensure stability before starting force control
+        if not self.force_control():
+            return False
+        print("Moved to force control")
         gripper.open_gripper()  # 그리퍼 열기
         if not self.wait_for_gripper_motion():
             return False
+        self.safe_movej(pat2, vel=VELOCITY, acc=ACC)
         self.safe_movej(check_pos, vel=VELOCITY, acc=ACC)
+
         try:
-            line_count = get_realsense_line_count()
+            line_count = get_realsense_line_count(save_debug=True)
             self.get_logger().info(f"Detected RealSense line count: {line_count}")
         except Exception as e:
             line_count = 0
             self.get_logger().error(f"Failed to detect RealSense line count: {e}")
 
-        if line_count == 0:
+        if line_count == 4:
             self.get_logger().info(
                 "line_count is 0. Moving to original trash bin."
             )
+            self.safe_movej(pat2, vel=VELOCITY, acc=ACC)
             self.safe_movej(pat3, vel=VELOCITY, acc=ACC)
-            gripper.close_gripper(force_val=100)  # 그리퍼 닫기
+            gripper.close_gripper(force_val=200)  # 그리퍼 닫기
             if not self.wait_for_gripper_motion():
                 return False
             self.safe_movej(pat2, vel=VELOCITY, acc=ACC)
             self.safe_movej(pat1, vel=VELOCITY, acc=ACC)
             return self.move_to_trash_bin(class_id)
         else:
-            gripper.close_gripper(force_val=100)  # 그리퍼 닫기
+            gripper.close_gripper(force_val=200)  # 그리퍼 닫기
             if not self.wait_for_gripper_motion():
                 return False
             testpos1 = [24.12, 1.99, 96.4, 88.28, -18.5, 1.37]
@@ -745,7 +808,8 @@ class RobotMoveNode(Node):
         mwait()
          # 대상 위치로 이동
 
-        if not self.close_gripper_and_wait(force_val=100):
+        grip_force = 400 if class_id in (1, 2) else 100
+        if not self.close_gripper_and_wait(force_val=grip_force):
             return False
 
         print("4. Moving up with the object...")

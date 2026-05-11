@@ -285,6 +285,7 @@ class DetectCalPosService(Node):
             depth_image=depth_image,
             camera_info=camera_info,
             base_xyz=xyz,
+            ignore_vertical_angle=center_detection["class_id"] in (1, 2),
         )
         x, y, z = xyz
         position = {
@@ -668,6 +669,7 @@ class DetectCalPosService(Node):
         depth_image=None,
         camera_info=None,
         base_xyz=None,
+        ignore_vertical_angle=False,
     ):
         if color_image is None or depth_image is None or camera_info is None:
             color_image, depth_image, camera_info = self.get_frames_once()
@@ -688,6 +690,12 @@ class DetectCalPosService(Node):
             depth_image,
             camera_info,
         )
+        if ignore_vertical_angle:
+            self.get_logger().info(
+                "Ignoring vertical angle for class_id 1/2 center object."
+            )
+            vertical_angle = None
+
         if (
             vertical_angle is not None
             and abs(vertical_angle) > VERTICAL_ANGLE_RXYZ_LIMIT_DEG
