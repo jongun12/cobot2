@@ -419,29 +419,25 @@ class RobotMoveNode(Node):
                     target_pos[5],
                 )
             )
-            if position["class_id"] != 0:
-                # 물체에 가까이 이동 ~ 분리수거 통 위
-                pick_success = self.pick_and_place_target(
-                    position["class_id"],
-                    target_pos,
+            pick_success = self.pick_and_place_target(
+                position["class_id"],
+                target_pos,
+            )
+            if pick_success:
+                trash_count_msg = Int32()
+                trash_count_msg.data = (
+                    self.last_disposal_class_id
+                    if self.last_disposal_class_id is not None
+                    else position["class_id"]
                 )
-                if pick_success:
-                    trash_count_msg = Int32()
-                    trash_count_msg.data = (
-                        self.last_disposal_class_id
-                        if self.last_disposal_class_id is not None
-                        else position["class_id"]
-                    )
-                    self.db_publisher.publish(trash_count_msg)
-                    self.wait_until_trash_not_full()
-                    if self.should_restart_scan():
-                        return False
-                else:
-                    self.get_logger().warn(
-                        "Pick failed. Skipping trash_count publish."
-                    )
+                self.db_publisher.publish(trash_count_msg)
+                self.wait_until_trash_not_full()
+                if self.should_restart_scan():
+                    return False
             else:
-                self.side_pick_and_place_target(position["class_id"], target_pos)
+                self.get_logger().warn(
+                    "Pick failed. Skipping trash_count publish."
+                )
 
             if self.should_restart_scan():
                 return False
@@ -839,119 +835,6 @@ class RobotMoveNode(Node):
         print("6. Operation completed.")
         return True
     
-    def side_pick_and_place_target(self, class_id, target_pos):
-        from DSR_ROBOT2 import posx, DR_MV_MOD_REL
-
-        print("Target object is too close to move above. Performing side pick-and-place.")
-        close_picture_pose = list(target_pos)
-        # 사진 찍는 위치로 이동 (조정 필요)
-        close_picture_pose[1] += 80 # y
-        y_temp = close_picture_pose[1]
-        close_picture_pose[2] = 190 # z 뎁스 인식이 잘 안되서 어려울 경우 그냥 값을 고정해도 됨
-        close_picture_pose[3] = 90
-        close_picture_pose[4] = -90
-        close_picture_pose[5] = 90
-        print("1. Moving to close picture pose...")
-        self.safe_movel(close_picture_pose, vel=VELOCITY, acc=ACC) # 사진 찍는 위치로 이동
-        if self.should_restart_scan():
-            return False
-
-        # 사진 찍고 더 정확한 위치 받아오기 + box 정보
-        print("Taking picture and getting more accurate position...")
-        center_position = None
-        self.center_base_positions_client.wait_for_service()
-        future = self.center_base_positions_client.call_async(SrvBasePositions.Request())
-
-        if not self.wait_for_future(future, SERVICE_TIMEOUT_SEC):
-            future.cancel()
-            self.get_logger().error(
-                "Timed out waiting for get_center_base_positions "
-                f"after {SERVICE_TIMEOUT_SEC:.1f}s."
-            )
-        elif future.result() is None:
-            self.get_logger().error("Failed to call get_center_base_positions service.")
-        else:
-            response = future.result()
-            if not response.success:
-                self.get_logger().warn(response.message)
-            else:
-                center_positions = self._parse_base_positions_response(response)
-                if center_positions:
-                    center_position = center_positions[0]
-                    target_pos = self._position_to_pose(center_position)
-                    self.get_logger().info(
-                        "Updated target pose from center object: "
-                        "[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]"
-                        % (
-                            target_pos[0],
-                            target_pos[1],
-                            target_pos[2],
-                            target_pos[3],
-                            target_pos[4],
-                            target_pos[5],
-                        )
-                    )
-                else:
-                    self.get_logger().warn(
-                        "get_center_base_positions returned no positions."
-                    )
-
-        # box 가로 너비 계산 (어쩌면 픽셀 단위일 수도 있으니 실제 크기로 변환 필요할 수도 있음, cal_positon에서 처리할 수도 있음)
-        
-
-
-        # ==================================================================================
-        if center_position is None:
-            self.get_logger().warn(
-                "Cannot continue side pick: center object was not detected."
-            )
-            return False
-
-        # 정확한 위치 (조정 필요)
-        target_pos[0] = close_picture_pose[0]  # x는 사진 찍는 위치로 고정
-        target_pos[1] = y_temp-80  # y 만약에 뎁스 인식이 잘 안되서 어려울 경우 처음 target_pos에서 y 값을 사용할 수도 있음
-        target_pos[2] = 180 # z
-        target_pos[3] = 90
-        target_pos[4] = -90
-        target_pos[5] = 90
-
-        pick_pos_side = list(target_pos)
-        pick_pos_side[1] += 100  # 대상 위치 옆으로 이동
-        
-        print("2. Moving to side position...")
-        self.safe_movel(pick_pos_side, vel=VELOCITY, acc=ACC) # 대상 위치 옆으로 이동
-        if self.should_restart_scan():
-            return False
-        print("3. Moving to target position...")
-        self.safe_movel(target_pos, vel=VELOCITY, acc=ACC) # 대상 위치로 이동
-        if self.should_restart_scan():
-            return False
-        
-        print("gripping...")
-        if not self.close_gripper_and_wait(force_val=100):
-            return False
-        
-        print("4. Moving side up with the object...")
-        self.safe_movel(posx([0,0,100,0,0,0]), vel=VELOCITY, acc=ACC, mod=DR_MV_MOD_REL) # 대상 위치 위로 이동
-        if self.should_restart_scan():
-            return False
-        if not self.is_object_gripped():
-            gripper.open_gripper()
-            self.wait_for_gripper_motion()
-            return False
-
-        print("5. Moving to bucket position...")
-        if not self.move_to_trash_bin(class_id):
-            return False
-
-        gripper.open_gripper()  # 그리퍼 열기
-        if not self.wait_for_gripper_motion():
-            return False
-
-        print("8. Operation completed.")
-        return True
-        
-
     def _parse_base_positions_response(self, response):
         boxes = list(response.boxes)
         if len(boxes) % 4 != 0:
