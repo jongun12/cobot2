@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
-import pyrealsense2 as rs
+import rclpy
+
+from cobot2.realsense3 import RealsenseFrameNode
 
 
 GRID = 50
@@ -11,11 +13,15 @@ MAX_THICK_GRID = 0.50
 MIN_ASPECT_RATIO = 1.0
 THRESHOLD_VALUE = 105
 MAX_LINE_COUNT = 4
+FRAME_TIMEOUT_SEC = 3.0
 
 
-def preprocess_ir(ir_image):
+def preprocess_image(image):
+    if len(image.shape) == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(ir_image)
+    enhanced = clahe.apply(image)
     blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
     _, binary = cv2.threshold(
         blurred,
@@ -60,44 +66,33 @@ def count_line_candidates(clean_image):
     return count
 
 
-def count_lines_from_ir_image(ir_image):
-    clean_image = preprocess_ir(ir_image)
+def count_lines_from_image(image):
+    clean_image = preprocess_image(image)
     line_count = count_line_candidates(clean_image)
     return max(0, min(MAX_LINE_COUNT, line_count))
 
 
-def get_realsense_ir_image(timeout_ms=2000, warmup_frames=5):
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 30)
+def get_realsense_color_image(timeout_sec=FRAME_TIMEOUT_SEC):
+    frame_node = RealsenseFrameNode("line_count_realsense_frame_node")
+    deadline = frame_node.get_clock().now().nanoseconds + int(timeout_sec * 1e9)
 
-    profile = pipeline.start(config)
-    depth_sensor = profile.get_device().first_depth_sensor()
-    depth_sensor.set_option(rs.option.emitter_enabled, 0)
-
-    try:
-        ir_frame = None
-        for _ in range(warmup_frames + 1):
-            frames = pipeline.wait_for_frames(timeout_ms)
-            ir_frame = frames.get_infrared_frame(1)
-
-        if not ir_frame:
+    while rclpy.ok() and not frame_node.has_color_frame():
+        rclpy.spin_once(frame_node, timeout_sec=0.1)
+        if frame_node.get_clock().now().nanoseconds >= deadline:
+            frame_node.destroy_node()
             return None
 
-        return np.asanyarray(ir_frame.get_data()).copy()
-    finally:
-        pipeline.stop()
+    color_image = frame_node.get_color_image()
+    frame_node.destroy_node()
+    return color_image
 
 
-def get_realsense_line_count(timeout_ms=2000, warmup_frames=5):
-    ir_image = get_realsense_ir_image(
-        timeout_ms=timeout_ms,
-        warmup_frames=warmup_frames,
-    )
-    if ir_image is None:
+def get_realsense_line_count(timeout_sec=FRAME_TIMEOUT_SEC):
+    color_image = get_realsense_color_image(timeout_sec=timeout_sec)
+    if color_image is None:
         return 0
 
-    return count_lines_from_ir_image(ir_image)
+    return count_lines_from_image(color_image)
 
 
 def calculate_water_level(tape_count):
@@ -105,23 +100,16 @@ def calculate_water_level(tape_count):
 
 
 def main():
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 30)
-
-    profile = pipeline.start(config)
-    depth_sensor = profile.get_device().first_depth_sensor()
-    depth_sensor.set_option(rs.option.emitter_enabled, 0)
-
+    rclpy.init()
+    frame_node = RealsenseFrameNode("line_count_realsense_frame_node")
     try:
-        while True:
-            frames = pipeline.wait_for_frames()
-            ir_frame = frames.get_infrared_frame(1)
-            if not ir_frame:
+        while rclpy.ok():
+            rclpy.spin_once(frame_node, timeout_sec=0.1)
+            color_image = frame_node.get_color_image()
+            if color_image is None:
                 continue
 
-            ir_image = np.asanyarray(ir_frame.get_data())
-            line_count = count_lines_from_ir_image(ir_image)
+            line_count = count_lines_from_image(color_image)
             water_level = calculate_water_level(line_count)
 
             print(f"line_count={line_count}, water_level={water_level}%")
@@ -129,7 +117,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        pipeline.stop()
+        frame_node.destroy_node()
+        rclpy.shutdown()
         print("Program End")
 
 

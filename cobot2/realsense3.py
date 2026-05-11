@@ -1,4 +1,5 @@
 from cv_bridge import CvBridge
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 
@@ -9,8 +10,8 @@ CAMERA_INFO_TOPIC = "/camera/camera/color/camera_info"
 
 
 class RealsenseFrameNode(Node):
-    def __init__(self):
-        super().__init__("realsense_frame_node")
+    def __init__(self, node_name="realsense_frame_node"):
+        super().__init__(node_name)
         self.bridge = CvBridge()
 
         self.color_msg = None
@@ -21,19 +22,19 @@ class RealsenseFrameNode(Node):
             Image,
             COLOR_IMAGE_TOPIC,
             self.color_callback,
-            10,
+            qos_profile_sensor_data,
         )
         self.create_subscription(
             Image,
             DEPTH_IMAGE_TOPIC,
             self.depth_callback,
-            10,
+            qos_profile_sensor_data,
         )
         self.create_subscription(
             CameraInfo,
             CAMERA_INFO_TOPIC,
             self.camera_info_callback,
-            10,
+            qos_profile_sensor_data,
         )
 
     def color_callback(self, msg):
@@ -50,6 +51,18 @@ class RealsenseFrameNode(Node):
             self.color_msg is not None
             and self.depth_msg is not None
             and self.camera_info is not None
+        )
+
+    def has_color_frame(self):
+        return self.color_msg is not None
+
+    def get_color_image(self):
+        if not self.has_color_frame():
+            return None
+
+        return self.bridge.imgmsg_to_cv2(
+            self.color_msg,
+            desired_encoding="bgr8",
         )
 
     def get_frames(self):
