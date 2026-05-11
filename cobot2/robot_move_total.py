@@ -2,9 +2,12 @@ from cobot2.onrobot import RG
 import DR_init
 import rclpy
 from od_msg.srv import SrvBasePositions
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+import threading
 import time
-from cobot2.test_retain import perform_movec
+from cobot2.test_retain import run_cluster_check_once
 from std_msgs.msg import Int32
 from std_srvs.srv import Trigger
 from dsr_msgs2.srv import MoveStop
@@ -33,6 +36,7 @@ gripper = RG(GRIPPER_NAME, TOOLCHANGER_IP, TOOLCHANGER_PORT)
 class RobotMoveNode(Node):
     def __init__(self):
         super().__init__("robot_move3")
+        self.voice_callback_group = ReentrantCallbackGroup()
         self.base_positions_client = self.create_client(
             SrvBasePositions,
             "get_base_positions",
@@ -54,11 +58,16 @@ class RobotMoveNode(Node):
         self.move_stop_client = self.create_client(
             MoveStop,
             f'/{ROBOT_ID}/motion/move_stop',
+            callback_group=self.voice_callback_group,
         )
         self.start_requested = False
         self.emergency_stopped = False
         self.voice_paused = False
         self.voice_target_class_ids = "all"
+        self.voice_disposal_class_id = None
+        self.voice_pause_interrupted_motion = False
+        self.awaiting_disposal_command = False
+        self.last_disposal_class_id = None
         self.restart_scan_requested = False
         self.start_subscription = self.create_subscription(
             Int32,
@@ -81,6 +90,7 @@ class RobotMoveNode(Node):
             voice_command_topic,
             self.voice_command_callback,
             10,
+            callback_group=self.voice_callback_group,
         )
         self.get_logger().info(
             f"Listening for voice commands on '{voice_command_topic}'."
@@ -98,7 +108,7 @@ class RobotMoveNode(Node):
     def wait_for_start_condition(self):
         self.get_logger().info("Waiting for start_condition=1...")
         while rclpy.ok() and not self.start_requested:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            time.sleep(0.1)
 
     def emergency_stop_callback(self, msg):
         if msg.data == 1:
@@ -113,24 +123,39 @@ class RobotMoveNode(Node):
 
     def voice_command_callback(self, msg):
         command = int(msg.data)
+        self.get_logger().warn(f"Received voice_command={command}.")
         if command == 0:
             if not self.voice_paused:
                 self.get_logger().warn("Voice command pause requested.")
             self.voice_paused = True
+            self.voice_pause_interrupted_motion = True
             self.request_move_stop()
         elif command == 1:
             if self.voice_paused:
-                self.get_logger().info("Voice command resume requested.")
+                self.get_logger().info(
+                    "Voice command resume requested. Using original trash bin."
+                )
+            self.voice_disposal_class_id = None
             self.voice_paused = False
         elif 2 <= command <= 7:
             class_id = command - 2
-            self.voice_target_class_ids = [class_id]
-            self.restart_scan_requested = True
-            self.voice_paused = False
-            self.get_logger().warn(
-                f"Voice command selected class_id={class_id}. Restarting scan."
-            )
-            self.request_move_stop()
+            if self.voice_paused or self.awaiting_disposal_command:
+                self.voice_disposal_class_id = class_id
+                self.voice_paused = False
+                self.awaiting_disposal_command = False
+                self.restart_scan_requested = False
+                self.get_logger().warn(
+                    "Voice command selected trash bin "
+                    f"class_id={class_id}. Resuming disposal."
+                )
+            else:
+                self.voice_target_class_ids = [class_id]
+                self.restart_scan_requested = True
+                self.voice_paused = False
+                self.get_logger().warn(
+                    f"Voice command selected class_id={class_id}. Restarting scan."
+                )
+                self.request_move_stop()
         else:
             self.get_logger().warn(f"Ignoring unknown voice command: {command}")
 
@@ -150,14 +175,14 @@ class RobotMoveNode(Node):
             self.get_logger().warn(
                 "Emergency stop is active. Waiting for emergency_stop=0..."
             )
-            rclpy.spin_once(self, timeout_sec=EMERGENCY_STOP_CHECK_PERIOD_SEC)
+            time.sleep(EMERGENCY_STOP_CHECK_PERIOD_SEC)
 
     def wait_while_voice_paused(self):
         while rclpy.ok() and self.voice_paused:
             self.get_logger().warn(
-                "Voice pause is active. Waiting for voice command 1..."
+                "Voice pause is active. Waiting for voice command 1 or 2~7..."
             )
-            rclpy.spin_once(self, timeout_sec=VOICE_PAUSE_CHECK_PERIOD_SEC)
+            time.sleep(VOICE_PAUSE_CHECK_PERIOD_SEC)
 
     def wait_until_motion_allowed(self):
         self.wait_while_emergency_stopped()
@@ -181,7 +206,6 @@ class RobotMoveNode(Node):
         if self.should_restart_scan():
             return None
         result = movel(*args, **kwargs)
-        rclpy.spin_once(self, timeout_sec=0.0)
         self.wait_until_motion_allowed()
         return result
 
@@ -192,9 +216,16 @@ class RobotMoveNode(Node):
         if self.should_restart_scan():
             return None
         result = movej(*args, **kwargs)
-        rclpy.spin_once(self, timeout_sec=0.0)
         self.wait_until_motion_allowed()
         return result
+
+    def wait_for_future(self, future, timeout_sec):
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and not future.done():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return future.done()
 
     def publish_task_complete(self):
         msg = Int32()
@@ -208,9 +239,8 @@ class RobotMoveNode(Node):
 
         self.get_logger().info("Calling get_base_positions service...")
         future = self.base_positions_client.call_async(SrvBasePositions.Request())
-        rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
 
-        if not future.done():
+        if not self.wait_for_future(future, SERVICE_TIMEOUT_SEC):
             future.cancel()
             self.get_logger().error(
                 f"Timed out waiting for get_base_positions after {SERVICE_TIMEOUT_SEC:.1f}s."
@@ -254,9 +284,8 @@ class RobotMoveNode(Node):
 
         self.get_logger().info("Calling center_of_center_points service...")
         future = self.center_of_center_client.call_async(SrvBasePositions.Request())
-        rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
 
-        if not future.done():
+        if not self.wait_for_future(future, SERVICE_TIMEOUT_SEC):
             future.cancel()
             self.get_logger().error(
                 "Timed out waiting for center_of_center_points "
@@ -397,7 +426,11 @@ class RobotMoveNode(Node):
                 )
                 if pick_success:
                     trash_count_msg = Int32()
-                    trash_count_msg.data = position["class_id"]
+                    trash_count_msg.data = (
+                        self.last_disposal_class_id
+                        if self.last_disposal_class_id is not None
+                        else position["class_id"]
+                    )
                     self.db_publisher.publish(trash_count_msg)
                     self.wait_until_trash_not_full()
                     if self.should_restart_scan():
@@ -419,9 +452,8 @@ class RobotMoveNode(Node):
             self.get_logger().info("Waiting for is_trash_full service...")
 
         future = self.flag_client.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
 
-        if not future.done():
+        if not self.wait_for_future(future, SERVICE_TIMEOUT_SEC):
             future.cancel()
             self.get_logger().error(
                 f"Timed out waiting for is_trash_full service "
@@ -462,7 +494,7 @@ class RobotMoveNode(Node):
             self.wait_until_motion_allowed()
             if self.should_restart_scan():
                 return False
-            rclpy.spin_once(self, timeout_sec=0.1)
+            time.sleep(0.1)
         return True
 
     def close_gripper_and_wait(self, force_val=100):
@@ -493,21 +525,77 @@ class RobotMoveNode(Node):
         self.get_logger().warn(f"Grip failed. width={width:.1f}mm")
         return False
 
+    def _trash_bin_posj_for_class_id(self, class_id):
+        if class_id == 1:  # plastic bottle
+            return [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
+        if class_id == 2:  # label o
+            return [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
+        if class_id == 3:  # plastic bottle
+            return [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
+        if class_id == 4:  # can
+            return [-47.38, 32.53, 49.7, -0.09, 97.36, -46.6]
+        if class_id == 5:  # box
+            return [-34.81, 44.83, 41.64, 11.51, 60.07, -33.78]
+        return [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
+
+    def _consume_disposal_class_id(self, original_class_id):
+        if self.voice_disposal_class_id is None:
+            disposal_class_id = original_class_id
+        else:
+            disposal_class_id = self.voice_disposal_class_id
+
+        self.voice_disposal_class_id = None
+        self.last_disposal_class_id = disposal_class_id
+        return disposal_class_id
+
+    def move_to_trash_bin(self, original_class_id):
+        from DSR_ROBOT2 import movej
+
+        while rclpy.ok():
+            self.awaiting_disposal_command = True
+            self.wait_until_motion_allowed()
+            self.awaiting_disposal_command = False
+            if self.should_restart_scan():
+                return False
+
+            self.voice_pause_interrupted_motion = False
+            disposal_class_id = self._consume_disposal_class_id(original_class_id)
+            trash_bin_posj = self._trash_bin_posj_for_class_id(disposal_class_id)
+            self.get_logger().info(
+                f"Moving to trash bin for class_id={disposal_class_id}."
+            )
+
+            movej(trash_bin_posj, vel=VELOCITY, acc=ACC)
+
+            if self.voice_pause_interrupted_motion:
+                self.get_logger().warn(
+                    "Trash bin move was interrupted by voice pause. "
+                    "Waiting for the next disposal command."
+                )
+                self.awaiting_disposal_command = True
+                continue
+
+            self.awaiting_disposal_command = True
+            self.wait_until_motion_allowed()
+            self.awaiting_disposal_command = False
+            if self.should_restart_scan():
+                return False
+
+            if self.voice_pause_interrupted_motion:
+                self.get_logger().warn(
+                    "Trash bin move was paused before release. "
+                    "Rechecking disposal command."
+                )
+                self.awaiting_disposal_command = True
+                continue
+
+            return True
+
+        self.awaiting_disposal_command = False
+        return False
+
     def pick_and_place_target(self, class_id, target_pos):
         from DSR_ROBOT2 import mwait, DR_MV_MOD_REL
-
-        if class_id == 1:  # plastic bottle
-            thrash_bin_posj = [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
-        elif class_id == 2:  # label o
-            thrash_bin_posj = [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
-        elif class_id == 3:  # plastic bottle
-            thrash_bin_posj = [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
-        elif class_id == 4:  # can
-            thrash_bin_posj = [-47.38, 32.53, 49.7, -0.09, 97.36, -46.6]
-        elif class_id == 5:  # box
-            thrash_bin_posj = [-34.81, 44.83, 41.64, 11.51, 60.07, -33.78]
-        else:
-            thrash_bin_posj = [-77.39, 13.9, 77.34, 0.17, 88.33, -76.44]
 
         close_picture_pose = list(target_pos)
         close_picture_pose[2] += 40
@@ -521,9 +609,8 @@ class RobotMoveNode(Node):
         center_position = None
         self.center_base_positions_client.wait_for_service()
         future = self.center_base_positions_client.call_async(SrvBasePositions.Request())
-        rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
 
-        if not future.done():
+        if not self.wait_for_future(future, SERVICE_TIMEOUT_SEC):
             future.cancel()
             self.get_logger().error(
                 "Timed out waiting for get_center_base_positions "
@@ -605,9 +692,7 @@ class RobotMoveNode(Node):
             return False
 
         print("5. Moving to bucket position...")
-        # movel(thrash_bin_pos, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
-        self.safe_movej(thrash_bin_posj, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
-        if self.should_restart_scan():
+        if not self.move_to_trash_bin(class_id):
             return False
         gripper.open_gripper()  # 그리퍼 열기
         if not self.wait_for_gripper_motion():
@@ -638,9 +723,8 @@ class RobotMoveNode(Node):
         center_position = None
         self.center_base_positions_client.wait_for_service()
         future = self.center_base_positions_client.call_async(SrvBasePositions.Request())
-        rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
 
-        if not future.done():
+        if not self.wait_for_future(future, SERVICE_TIMEOUT_SEC):
             future.cancel()
             self.get_logger().error(
                 "Timed out waiting for get_center_base_positions "
@@ -685,12 +769,6 @@ class RobotMoveNode(Node):
             )
             return False
 
-        thrash_bin_pos = [300, -300, 200, 155.1, 179.8, 155.4]
-        if center_position["class_id"] == 1:  # label x
-            thrash_bin_pos = [300, -300, 200, 155.1, 179.8, 155.4]
-        elif center_position["class_id"] == 2:  # label o
-            thrash_bin_pos = [300, -300, 200, 155.1, 179.8, 155.4]
-
         # 정확한 위치 (조정 필요)
         target_pos[0] = close_picture_pose[0]  # x는 사진 찍는 위치로 고정
         target_pos[1] = y_temp-80  # y 만약에 뎁스 인식이 잘 안되서 어려울 경우 처음 target_pos에서 y 값을 사용할 수도 있음
@@ -725,8 +803,7 @@ class RobotMoveNode(Node):
             return False
 
         print("5. Moving to bucket position...")
-        self.safe_movel(thrash_bin_pos, vel=VELOCITY, acc=ACC) # 버킷 위치로 이동
-        if self.should_restart_scan():
+        if not self.move_to_trash_bin(class_id):
             return False
 
         gripper.open_gripper()  # 그리퍼 열기
@@ -811,21 +888,18 @@ def main(args=None):
     dsr_node = rclpy.create_node("robot_move3_dsr", namespace=ROBOT_ID)
     DR_init.__dsr__node = dsr_node
     node = RobotMoveNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
     try:
         from DSR_ROBOT2 import posx
-        # Test mode: start immediately without waiting for Firebase start_condition.
-        # node.wait_for_start_condition()
+        node.wait_for_start_condition()
         CENTER_POINT = (500.0, -50.0)
         Z0 = 300
         HIGHT = 150
-        center_xyz = node.request_center_of_centers_xyz()
-        if center_xyz is not None:
-            # perform_movec(center_xyz)
-            ...
-        else:
-            node.get_logger().warn(
-                "center_of_center_points returned no xyz. Skipping stirring motion."
-            )
+
+        run_cluster_check_once()
 
         gripper.open_gripper()  # 그리퍼 열기
         node.wait_for_gripper_motion()
@@ -881,6 +955,8 @@ def main(args=None):
                 break
         node.safe_movej(P0, vel=VELOCITY, acc=ACC) # 초기 위치로 이동
     finally:
+        executor.shutdown()
+        spin_thread.join(timeout=1.0)
         node.destroy_node()
         dsr_node.destroy_node()
         rclpy.shutdown()
