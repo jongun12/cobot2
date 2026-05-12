@@ -36,6 +36,7 @@ setup(
             'object_detection_node2 = cobot2.detection2:main',
             'object_detection_service = cobot2.detection3_service:main',
             'detect_cal_pos_service = cobot2.detect_cal_pos_service:main',
+            'yolo_predict_camera = cobot2.yolo_predict_camera:main',
             'cal_position = cobot2.cal_position:main',
             'realsense_service = cobot2.realsense2:main',
             'robot_move4 = cobot2.robot_move4:main',

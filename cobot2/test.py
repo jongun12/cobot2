@@ -2,25 +2,47 @@ import cv2
 import numpy as np
 import os
 import rclpy
+import statistics
 import time
 
-from cobot2.realsense3 import RealsenseFrameNode
+from cv_bridge import CvBridge
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
 
 
 GRID = 50
-MIN_LENGTH_GRID = 5.0
+MIN_LENGTH_GRID = 3.5
 MAX_LENGTH_GRID = 8.0
 MIN_THICK_GRID = 0.10
-MAX_THICK_GRID = 2.5
+MAX_THICK_GRID = 2.3
 MIN_ASPECT_RATIO = 1.0
 THRESHOLD_VALUE = 125
 MAX_LINE_COUNT = 4
-FRAME_TIMEOUT_SEC = 3.0
+FRAME_TIMEOUT_SEC = 2.0
+DEFAULT_SAMPLE_DURATION_SEC = 3.0
 DEBUG_IMAGE_DIR = "/tmp/cobot2_line_count_debug"
 ROI_X1 = 600
 ROI_Y1 = 250
 ROI_X2 = 900
 ROI_Y2 = 600
+COLOR_IMAGE_TOPIC = "/camera/camera/color/image_raw"
+
+
+class ColorFrameNode(Node):
+    def __init__(self):
+        super().__init__("line_count_color_frame_node")
+        self.bridge = CvBridge()
+        self.color_msg = None
+        self.create_subscription(
+            Image,
+            COLOR_IMAGE_TOPIC,
+            self.color_callback,
+            qos_profile_sensor_data,
+        )
+
+    def color_callback(self, msg):
+        self.color_msg = msg
 
 
 def preprocess_image(image):
@@ -214,17 +236,21 @@ def save_debug_image(image, line_count, output_dir=DEBUG_IMAGE_DIR):
         "latest_detection_water_level.jpg",
     )
 
-    cv2.imwrite(raw_path, color_image)
-    cv2.imwrite(clean_path, clean_vis)
-    cv2.imwrite(detection_path, detection_vis)
-    cv2.imwrite(latest_clean_path, clean_vis)
-    cv2.imwrite(latest_detection_path, detection_vis)
+    write_results = [
+        cv2.imwrite(raw_path, color_image),
+        cv2.imwrite(clean_path, clean_vis),
+        cv2.imwrite(detection_path, detection_vis),
+        cv2.imwrite(latest_clean_path, clean_vis),
+        cv2.imwrite(latest_detection_path, detection_vis),
+    ]
+    if not all(write_results):
+        print(f"Failed to write one or more debug images to {output_dir}")
 
     return detection_path
 
 
 def get_realsense_color_image(timeout_sec=FRAME_TIMEOUT_SEC):
-    frame_node = RealsenseFrameNode()
+    frame_node = ColorFrameNode()
     deadline = frame_node.get_clock().now().nanoseconds + int(timeout_sec * 1e9)
 
     while rclpy.ok() and frame_node.color_msg is None:
@@ -241,15 +267,62 @@ def get_realsense_color_image(timeout_sec=FRAME_TIMEOUT_SEC):
     return color_image
 
 
-def get_realsense_line_count(timeout_sec=FRAME_TIMEOUT_SEC, save_debug=False):
-    color_image = get_realsense_color_image(timeout_sec=timeout_sec)
-    if color_image is None:
+def get_realsense_line_count(
+    timeout_sec=FRAME_TIMEOUT_SEC,
+    sample_duration_sec=DEFAULT_SAMPLE_DURATION_SEC,
+    save_debug=False,
+):
+    frame_node = ColorFrameNode()
+    first_frame_deadline = (
+        frame_node.get_clock().now().nanoseconds
+        + int(timeout_sec * 1e9)
+    )
+    sample_deadline = None
+    line_counts = []
+    latest_color_image = None
+
+    while rclpy.ok():
+        rclpy.spin_once(frame_node, timeout_sec=0.1)
+        now_ns = frame_node.get_clock().now().nanoseconds
+
+        if frame_node.color_msg is None:
+            if now_ns >= first_frame_deadline:
+                frame_node.destroy_node()
+                if save_debug:
+                    print(
+                        "No RealSense color frame received. "
+                        "Debug image was not saved."
+                    )
+                return 0
+            continue
+
+        if sample_deadline is None:
+            sample_deadline = now_ns + int(sample_duration_sec * 1e9)
+
+        color_image = frame_node.bridge.imgmsg_to_cv2(
+            frame_node.color_msg,
+            desired_encoding="bgr8",
+        )
+        latest_color_image = color_image
+        line_counts.append(count_lines_from_image(color_image))
+        frame_node.color_msg = None
+
+        if now_ns >= sample_deadline:
+            break
+
+    frame_node.destroy_node()
+
+    if not line_counts:
         return 0
 
-    line_count = count_lines_from_image(color_image)
+    line_count = int(statistics.median(line_counts))
     if save_debug:
-        debug_path = save_debug_image(color_image, line_count)
-        print(f"Saved line count debug image: {debug_path}")
+        debug_path = save_debug_image(latest_color_image, line_count)
+        print(
+            f"Saved line count debug image: {debug_path}, "
+            f"output_dir={DEBUG_IMAGE_DIR}, "
+            f"samples={line_counts}"
+        )
 
     return line_count
 
@@ -260,31 +333,13 @@ def calculate_water_level(tape_count):
 
 def main():
     rclpy.init()
-    frame_node = RealsenseFrameNode()
     try:
-        while rclpy.ok():
-            rclpy.spin_once(frame_node, timeout_sec=0.1)
-            if frame_node.color_msg is None:
-                continue
-
-            color_image = frame_node.bridge.imgmsg_to_cv2(
-                frame_node.color_msg,
-                desired_encoding="bgr8",
-            )
-            line_count = count_lines_from_image(color_image)
-            water_level = calculate_water_level(line_count)
-            debug_path = save_debug_image(color_image, line_count)
-
-            print(
-                f"line_count={line_count}, water_level={water_level}%, "
-                f"debug={debug_path}"
-            )
-            break
-
+        line_count = get_realsense_line_count(save_debug=True)
+        water_level = calculate_water_level(line_count)
+        print(f"median_line_count={line_count}, water_level={water_level}%")
     except KeyboardInterrupt:
         pass
     finally:
-        frame_node.destroy_node()
         rclpy.shutdown()
         print("Program End")
 

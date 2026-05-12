@@ -2,13 +2,11 @@ import threading
 import time
 import cv2
 import numpy as np
-from flask import Flask, jsonify, request
-from flask_cors import CORS
 
 import rclpy
+
 import DR_init
 from cobot2.onrobot import RG
-
 
 # =====================================================
 # Robot Settings
@@ -62,7 +60,7 @@ CLOSE_KERNEL = np.ones((7, 7), np.uint8)
 # 2 | 3
 
 QUADRANT_BASE_POS = {
-    0: [433, -76, 150],
+    0: [433, -76,150],
     1: [256, -76, 150],
     2: [433,  116, 150],
     3: [256,  116, 150],
@@ -75,67 +73,6 @@ QUADRANT_BASE_POS = {
 target_clusters = None
 is_busy = False
 
-# =====================================================
-# Frame 공유 (브라우저 → 파이썬)
-# =====================================================
-
-capture_requested = False
-latest_frame      = None
-frame_event       = threading.Event()
-frame_lock        = threading.Lock()
-
-
-# =====================================================
-# Flask 서버
-# =====================================================
-
-app = Flask(__name__)
-CORS(app)
-
-
-@app.route('/capture_ready', methods=['GET'])
-def capture_ready():
-    global capture_requested
-    return jsonify({'requested': capture_requested})
-
-
-@app.route('/upload_frame', methods=['POST'])
-def upload_frame():
-    global latest_frame, capture_requested
-
-    file = request.files.get('frame')
-    if file is None:
-        return jsonify({'error': 'no frame'}), 400
-
-    img_array = np.frombuffer(file.read(), dtype=np.uint8)
-    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-    if frame is None:
-        return jsonify({'error': 'decode failed'}), 400
-
-    with frame_lock:
-        latest_frame      = frame
-        capture_requested = False
-
-    frame_event.set()
-
-    return jsonify({'ok': True})
-
-
-def start_flask(port=5050):
-    import logging
-    logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    t = threading.Thread(
-        target=lambda: app.run(host='0.0.0.0', port=port, threaded=True),
-        daemon=True
-    )
-    t.start()
-    print(f"[Flask] 브라우저 수신 서버 시작: http://0.0.0.0:{port}")
-
-start_flask(port=5050)
-# =====================================================
-# Debug View
-# =====================================================
 
 def show_debug_view(vis, yellow_mask=None, occluded_mask=None):
     cv2.imshow("test_retain debug", vis)
@@ -293,7 +230,7 @@ def perform_cluster_release(base_xyz):
 
     # start movec
 
-    for i in range(1, 4):
+    for i in range(1,4) :
         first_mid = posx(
             bx + (i * 20),
             by,
@@ -313,14 +250,20 @@ def perform_cluster_release(base_xyz):
         )
 
         movec(
-            first_mid,
-            first_end,
-            vel=80,
-            acc=80,
-            ref=DR_BASE,
-        )
+        first_mid,
+        first_end,
+        vel=80,
+        acc=80,
+        ref=DR_BASE,
+         )
+        
+    
+    
+
 
     print("GRIPPER CLOSED")
+
+
 
     gripper.open_gripper()
 
@@ -342,30 +285,31 @@ def perform_cluster_release(base_xyz):
 
 
 # =====================================================
-# Vision Check (브라우저에서 프레임 받아서 처리)
+# Vision Thread
 # =====================================================
 
-def vision_check_once(debug_view=False, timeout=10):
+# =====================================================
+# Single Vision + Robot Execute
+# =====================================================
 
-    global target_clusters, capture_requested
+def vision_check_once(debug_view=False):
+
+    global target_clusters
 
     target_clusters = None
-    frame_event.clear()
 
-    print("[Vision] 브라우저에 캡처 요청 중...")
-    capture_requested = True
+    cap = cv2.VideoCapture(4)
 
-    arrived = frame_event.wait(timeout=timeout)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    if not arrived:
-        print("[Vision] 프레임 수신 타임아웃")
-        capture_requested = False
+    ret, frame = cap.read()
+
+    if not ret:
+        print("Camera read failed")
+        cap.release()
         return
-
-    with frame_lock:
-        frame = latest_frame.copy()
-
-    print("[Vision] 프레임 수신 완료 → 비전 처리 시작")
 
     vis = frame.copy()
 
@@ -411,6 +355,7 @@ def vision_check_once(debug_view=False, timeout=10):
         if debug_view:
             show_debug_view(vis, yellow_mask)
 
+        cap.release()
         return
 
     # =============================================
@@ -595,6 +540,8 @@ def vision_check_once(debug_view=False, timeout=10):
     if debug_view:
         show_debug_view(vis, yellow_mask, occluded_mask)
 
+    cap.release()
+
 
 # =====================================================
 # Robot Execute
@@ -682,17 +629,5 @@ def run_cluster_check_once(debug_view=False):
     robot_task_loop()
 
 
-# =====================================================
-# Main
-# =====================================================
-
 if __name__ == "__main__":
-
-    # Flask 서버 백그라운드 시작
-    
-
-    # 브라우저가 연결될 시간 대기
-
-
-    # 실행
-    run_cluster_check_once(debug_view=True)
+    run_cluster_check_once(True)

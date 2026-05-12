@@ -5,6 +5,7 @@ from od_msg.srv import SrvBasePositions
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+import statistics
 import threading
 import time
 from cobot2.test import get_realsense_line_count
@@ -674,8 +675,19 @@ class RobotMoveNode(Node):
         self.safe_movej(check_pos, vel=VELOCITY, acc=ACC)
 
         try:
-            line_count = get_realsense_line_count(save_debug=True)
-            self.get_logger().info(f"Detected RealSense line count: {line_count}")
+            line_count = 0
+            _ = [9.84, -2.13, 100.49, 77.93, -4.43, 9.73]
+            self.safe_movel(_, vel=VELOCITY, acc=ACC)
+            line_count1 = get_realsense_line_count(save_debug=True)
+            _[1] -= 3
+            self.safe_movel(_, vel=VELOCITY, acc=ACC)
+            line_count2 = get_realsense_line_count(save_debug=True)
+            _[1] -= 3
+            self.safe_movel(_, vel=VELOCITY, acc=ACC)
+            line_count3 = get_realsense_line_count(save_debug=True)
+            line_counts = [line_count1, line_count2, line_count3]
+            self.get_logger().info(f"Detected RealSense line counts: {line_counts}")
+            line_count = int(statistics.median(line_counts))
         except Exception as e:
             line_count = 0
             self.get_logger().error(f"Failed to detect RealSense line count: {e}")
@@ -916,7 +928,7 @@ def main(args=None):
     try:
         from DSR_ROBOT2 import posx
         node.wait_for_start_condition()
-        CENTER_POINT = (500.0, -50.0)
+        CENTER_POINT = (500.0, -100.0)
         Z0 = 300
         HIGHT = 150
 
